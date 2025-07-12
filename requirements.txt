@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+groq
+python-dotenv
+pydantic
+json
+flask
+flsk_cors
+
