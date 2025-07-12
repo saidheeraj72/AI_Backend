@@ -3,6 +3,4 @@ uvicorn
 groq
 python-dotenv
 pydantic
-flask
-flsk_cors
 
