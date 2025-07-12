@@ -1,0 +1,27 @@
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Compiled Python files
+__pycache__/
+*.pyc
+
+# IDE-specific files
+.idea/
+.vscode/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Sensitive information (example)
+.env
