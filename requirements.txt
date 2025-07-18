@@ -6,4 +6,15 @@ pydantic
 pymongo 
 motor 
 python-multipart
-
+PyPDF2
+python-docx
+python-pptx
+openpyxl
+langchain_huggingface
+sentence-transformers
+faiss-cpu
+langchain
+langchain-community
+pandas
+aiofiles
+python-multipart
