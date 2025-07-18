@@ -271,7 +271,7 @@ async def connect_to_mongo():
     await database.chat_sessions.create_index([("user_id", ASCENDING), ("updated_at", DESCENDING)])
     await database.chat_messages.create_index([("session_id", ASCENDING), ("message_order", ASCENDING)])
 
-async def close_mongo_connection():
+async def close_mongo_connection():  
     if mongodb_client:
         mongodb_client.close()
 
