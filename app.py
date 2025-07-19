@@ -274,7 +274,7 @@ async def connect_to_mongo():
 async def close_mongo_connection():  
     if mongodb_client:
         mongodb_client.close()
-
+ 
 async def get_database():
     return database
 
