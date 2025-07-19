@@ -1,0 +1,18 @@
+{
+  "documents": [
+    {
+      "id": "37718ce9-0d85-4b28-bc4f-e9c7d349c953",
+      "filename": "Bharath_resume.pdf",
+      "file_type": "application/pdf",
+      "processed_at": "2025-07-19T08:07:42.686944",
+      "text_length": 3384
+    },
+    {
+      "id": "940bab72-e2aa-4a57-91b8-46160805652b",
+      "filename": "cs21b2021_final_report.pdf",
+      "file_type": "application/pdf",
+      "processed_at": "2025-07-19T08:10:49.551036",
+      "text_length": 51901
+    }
+  ]
+}

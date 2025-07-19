@@ -13,11 +13,13 @@ import tempfile
 import shutil
 
 # Document processing imports
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import PyPDF2
 from docx import Document as DocxDocument
+
+# Vector database and embeddings imports
+from pinecone import Pinecone, ServerlessSpec
+import google.generativeai as genai
 
 # Database imports
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -40,12 +42,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-port = int(os.environ.get("PORT"))
+
 
 # Initialize clients
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 mongodb_client = None
 database = None
+
+# Initialize Google AI and Pinecone
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
 # LLM Model configurations
 LLM_MODELS = {
@@ -72,13 +78,60 @@ LLM_MODELS = {
 # ===== DOCUMENT PROCESSOR CLASS =====
 class DocumentProcessor:
     def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.dimension = 384
-        self.index = faiss.IndexFlatL2(self.dimension)
+        self.embedding_model = "text-embedding-004"
+        self.dimension = 768  # Google's text-embedding-004 dimension
+        self.index_name = os.getenv("PINECONE_INDEX_NAME", "ai-chat-rag")
+        self.namespace = "documents"
+        
+        # Initialize Pinecone index
+        try:
+            # Check if index exists, if not create it
+            existing_indexes = [index.name for index in pinecone_client.list_indexes()]
+            if self.index_name not in existing_indexes:
+                pinecone_client.create_index(
+                    name=self.index_name,
+                    dimension=self.dimension,
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud="aws",
+                        region="us-east-1"
+                    )
+                )
+            self.index = pinecone_client.Index(self.index_name)
+        except Exception as e:
+            print(f"Warning: Could not initialize Pinecone index: {e}")
+            self.index = None
+        
         self.documents = []
-        self.chunks = []
         self.chunk_size = 1000
         self.chunk_overlap = 200
+        
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using Google's embedding model"""
+        try:
+            embeddings = []
+            for text in texts:
+                result = genai.embed_content(
+                    model=f"models/{self.embedding_model}",
+                    content=text,
+                    task_type="retrieval_document"
+                )
+                embeddings.append(result['embedding'])
+            return embeddings
+        except Exception as e:
+            raise Exception(f"Error generating embeddings: {str(e)}")
+    
+    def get_query_embedding(self, query: str) -> List[float]:
+        """Generate embedding for search query"""
+        try:
+            result = genai.embed_content(
+                model=f"models/{self.embedding_model}",
+                content=query,
+                task_type="retrieval_query"
+            )
+            return result['embedding']
+        except Exception as e:
+            raise Exception(f"Error generating query embedding: {str(e)}")
         
     def extract_text_from_pdf(self, file_content: bytes) -> str:
         try:
@@ -118,6 +171,9 @@ class DocumentProcessor:
     
     def process_document(self, file_content: bytes, filename: str, file_type: str) -> str:
         try:
+            if not self.index:
+                raise Exception("Pinecone index not initialized")
+                
             # Extract text based on file type
             if file_type == 'application/pdf':
                 text = self.extract_text_from_pdf(file_content)
@@ -142,21 +198,29 @@ class DocumentProcessor:
             chunks = self.chunk_text(text)
             
             # Generate embeddings
-            embeddings = self.model.encode(chunks)
+            embeddings = self.get_embeddings(chunks)
             
-            # Add to FAISS index
-            self.index.add(embeddings.astype('float32'))
-            
-            # Store metadata
-            chunk_start_idx = len(self.chunks)
-            for i, chunk in enumerate(chunks):
-                self.chunks.append({
+            # Prepare vectors for Pinecone
+            vectors_to_upsert = []
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                vector_id = f"{doc_id}_{i}"
+                metadata = {
                     'doc_id': doc_id,
-                    'chunk_idx': chunk_start_idx + i,
+                    'chunk_idx': i,
                     'text': chunk,
-                    'filename': filename
+                    'filename': filename,
+                    'file_type': file_type
+                }
+                vectors_to_upsert.append({
+                    'id': vector_id,
+                    'values': embedding,
+                    'metadata': metadata
                 })
             
+            # Upsert vectors to Pinecone
+            self.index.upsert(vectors=vectors_to_upsert, namespace=self.namespace)
+            
+            # Store document metadata locally
             self.documents.append(document_metadata)
             
             return doc_id
@@ -166,18 +230,30 @@ class DocumentProcessor:
     
     def search_similar_chunks(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         try:
-            if self.index.ntotal == 0:
+            if not self.index:
                 return []
             
-            query_embedding = self.model.encode([query]).astype('float32')
-            distances, indices = self.index.search(query_embedding, k)
+            # Generate query embedding
+            query_embedding = self.get_query_embedding(query)
+            
+            # Search Pinecone
+            search_response = self.index.query(
+                vector=query_embedding,
+                top_k=k,
+                include_metadata=True,
+                namespace=self.namespace
+            )
             
             results = []
-            for i, idx in enumerate(indices[0]):
-                if idx < len(self.chunks):
-                    chunk_data = self.chunks[idx].copy()
-                    chunk_data['similarity_score'] = float(distances[0][i])
-                    results.append(chunk_data)
+            for match in search_response.matches:
+                chunk_data = {
+                    'doc_id': match.metadata['doc_id'],
+                    'chunk_idx': match.metadata['chunk_idx'],
+                    'text': match.metadata['text'],
+                    'filename': match.metadata['filename'],
+                    'similarity_score': float(match.score)
+                }
+                results.append(chunk_data)
             
             return results
             
@@ -189,49 +265,50 @@ class DocumentProcessor:
     
     def delete_document(self, doc_id: str) -> bool:
         try:
-            self.documents = [doc for doc in self.documents if doc['id'] != doc_id]
-            self.chunks = [chunk for chunk in self.chunks if chunk['doc_id'] != doc_id]
+            if not self.index:
+                return False
+                
+            # Get all vectors for this document
+            query_response = self.index.query(
+                vector=[0.0] * self.dimension,  # Dummy vector
+                top_k=10000,  # Large number to get all
+                include_metadata=True,
+                filter={'doc_id': doc_id},
+                namespace=self.namespace
+            )
             
-            # Rebuild FAISS index
-            self.index = faiss.IndexFlatL2(self.dimension)
-            if self.chunks:
-                texts = [chunk['text'] for chunk in self.chunks]
-                embeddings = self.model.encode(texts)
-                self.index.add(embeddings.astype('float32'))
+            # Delete vectors from Pinecone
+            vector_ids = [match.id for match in query_response.matches]
+            if vector_ids:
+                self.index.delete(ids=vector_ids, namespace=self.namespace)
+            
+            # Remove from local documents list
+            self.documents = [doc for doc in self.documents if doc['id'] != doc_id]
             
             return True
             
         except Exception as e:
             raise Exception(f"Error deleting document: {str(e)}")
     
-    def save_index(self, filepath: str):
+    def save_metadata(self, filepath: str):
+        """Save document metadata to local file"""
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            faiss.write_index(self.index, f"{filepath}.index")
-            
-            metadata = {
-                'documents': self.documents,
-                'chunks': self.chunks
-            }
+            metadata = {'documents': self.documents}
             with open(f"{filepath}.json", 'w') as f:
                 json.dump(metadata, f, indent=2)
-                
         except Exception as e:
-            raise Exception(f"Error saving index: {str(e)}")
+            raise Exception(f"Error saving metadata: {str(e)}")
     
-    def load_index(self, filepath: str):
+    def load_metadata(self, filepath: str):
+        """Load document metadata from local file"""
         try:
-            if os.path.exists(f"{filepath}.index"):
-                self.index = faiss.read_index(f"{filepath}.index")
-            
             if os.path.exists(f"{filepath}.json"):
                 with open(f"{filepath}.json", 'r') as f:
                     metadata = json.load(f)
                     self.documents = metadata.get('documents', [])
-                    self.chunks = metadata.get('chunks', [])
-                    
         except Exception as e:
-            raise Exception(f"Error loading index: {str(e)}")
+            raise Exception(f"Error loading metadata: {str(e)}")
 
 # Global document processor instance
 doc_processor = DocumentProcessor()
@@ -316,13 +393,13 @@ async def get_chat_history(session_id: str) -> List[dict]:
 @app.on_event("startup")
 async def startup_events():
     await connect_to_mongo()
-    doc_processor.load_index("./data/faiss_index")
+    doc_processor.load_metadata("./data/metadata")
 
 @app.on_event("shutdown")
 async def shutdown_events():
     await close_mongo_connection()
     os.makedirs("./data", exist_ok=True)
-    doc_processor.save_index("./data/faiss_index")
+    doc_processor.save_metadata("./data/metadata")
 
 # ===== CHAT ENDPOINTS =====
 @app.post('/chat')
@@ -487,8 +564,6 @@ async def rag_chat(request: Request):
         
         response_text = completion.choices[0].message.content
         
-        # DO NOT add source information to response
-        
         # Save messages to database
         if session_id:
             next_order = len(chat_history)
@@ -502,7 +577,6 @@ async def rag_chat(request: Request):
             'session_id': session_id,
             'relevant_chunks': len(relevant_chunks),
             'status': 'success'
-            # NO SOURCES RETURNED
         })
         
     except Exception as e:
@@ -583,9 +657,9 @@ async def upload_document(file: UploadFile = File(...)):
         file_content = await file.read()
         doc_id = doc_processor.process_document(file_content, file.filename, file.content_type)
         
-        # Save index
+        # Save metadata
         os.makedirs("./data", exist_ok=True)
-        doc_processor.save_index("./data/faiss_index")
+        doc_processor.save_metadata("./data/metadata")
         
         return JSONResponse({
             'doc_id': doc_id,
@@ -613,7 +687,7 @@ async def delete_document(doc_id: str):
         success = doc_processor.delete_document(doc_id)
         if success:
             os.makedirs("./data", exist_ok=True)
-            doc_processor.save_index("./data/faiss_index")
+            doc_processor.save_metadata("./data/metadata")
             return JSONResponse({
                 'status': 'success',
                 'message': 'Document deleted successfully'
@@ -730,10 +804,10 @@ async def health_check():
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
         'documents_indexed': len(doc_processor.documents),
-        'chunks_indexed': len(doc_processor.chunks)
+        'pinecone_connected': doc_processor.index is not None
     })
 
 # ===== RUN SERVER =====
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run('app:app', host='0.0.0.0', port=port, reload=True)
+    uvicorn.run('app:app', host='0.0.0.0', port=8000, reload=True)
