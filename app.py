@@ -40,6 +40,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+port = int(os.environ.get("PORT"))
 
 # Initialize clients
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -735,4 +736,4 @@ async def health_check():
 # ===== RUN SERVER =====
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run('app:app', host='0.0.0.0', port=8000, reload=True)
+    uvicorn.run('app:app', host='0.0.0.0', port=port, reload=True)
