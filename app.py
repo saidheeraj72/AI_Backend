@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.requests import Request  # Explicit import for FastAPI Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from contextlib import asynccontextmanager
 import os
 import uuid
 import json
@@ -11,6 +13,10 @@ from datetime import datetime
 from io import BytesIO
 import tempfile
 import shutil
+import pickle
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pydantic import BaseModel, EmailStr
 
 # Document processing imports
 import numpy as np
@@ -29,10 +35,63 @@ from pymongo import ASCENDING, DESCENDING
 from groq import Groq
 from dotenv import load_dotenv
 
+# Supabase imports
+from supabase import create_client, Client
+
+# Gmail API imports (with aliases to avoid conflicts)
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request as GoogleRequest  # Aliased import
+from google.oauth2.credentials import Credentials
+
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="AI Chat Backend with RAG", version="1.0.0")
+# Global variables
+mongodb_client = None
+database = None
+doc_processor = None
+
+# Initialize clients
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Initialize Supabase
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(supabase_url, supabase_key)
+
+# Initialize Google AI and Pinecone
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+
+# Gmail API Configuration
+SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly']
+CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.pickle'
+
+# ===== LIFESPAN EVENT HANDLER =====
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await connect_to_mongo()
+    global doc_processor
+    doc_processor = DocumentProcessor()
+    doc_processor.load_metadata("./data/metadata")
+    
+    yield
+    
+    # Shutdown
+    await close_mongo_connection()
+    os.makedirs("./data", exist_ok=True)
+    if doc_processor:
+        doc_processor.save_metadata("./data/metadata")
+
+# Initialize FastAPI with lifespan
+app = FastAPI(
+    title="AI Chat Backend with RAG and Email Automation", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 # Enable CORS
 app.add_middleware(
@@ -43,15 +102,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===== PYDANTIC MODELS =====
 
-# Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-mongodb_client = None
-database = None
+# Employee models
+class EmployeeCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    position: Optional[str] = None
+    department: Optional[str] = None
 
-# Initialize Google AI and Pinecone
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+class EmployeeUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    position: Optional[str] = None
+    department: Optional[str] = None
+    status: Optional[str] = None
+
+class EmployeeResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    phone: Optional[str]
+    position: Optional[str]
+    department: Optional[str]
+    status: str
+    created_at: str
+    updated_at: Optional[str]
+
+# Email models
+class EmailTemplate(BaseModel):
+    name: str
+    subject: str
+    body: str
+    is_html: bool = True
+
+class EmailTemplateUpdate(BaseModel):
+    name: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    is_html: Optional[bool] = None
+
+class EmailCampaign(BaseModel):
+    name: str
+    template_id: int
+    recipient_list: List[str]
+    scheduled_time: Optional[str] = None
+
+class EmailSend(BaseModel):
+    to: List[str]
+    subject: str
+    body: str
+    is_html: bool = True
+    template_id: Optional[int] = None
 
 # LLM Model configurations
 LLM_MODELS = {
@@ -74,6 +178,68 @@ LLM_MODELS = {
         'supports_vision': False
     }
 }
+
+# ===== GMAIL API FUNCTIONS =====
+
+def authenticate_gmail():
+    """Authenticate and return Gmail service"""
+    creds = None
+    
+    # Token file stores the user's access and refresh tokens
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If there are no (valid) credentials available, let the user log in
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleRequest())  # Using the aliased GoogleRequest
+            except Exception as e:
+                print(f"Error refreshing token: {e}")
+                creds = None
+        
+        if not creds:
+            if not os.path.exists(CREDENTIALS_FILE):
+                raise Exception("credentials.json file not found. Please download it from Google Cloud Console.")
+            
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # Save the credentials for the next run
+        with open(TOKEN_FILE, 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return build('gmail', 'v1', credentials=creds)
+
+def create_message(to, subject, body, is_html=True):
+    """Create email message"""
+    if is_html:
+        message = MIMEMultipart('alternative')
+        message['to'] = ', '.join(to) if isinstance(to, list) else to
+        message['subject'] = subject
+        
+        # Create both plain text and HTML versions
+        text_part = MIMEText(body, 'plain')
+        html_part = MIMEText(body, 'html')
+        message.attach(text_part)
+        message.attach(html_part)
+    else:
+        message = MIMEText(body, 'plain')
+        message['to'] = ', '.join(to) if isinstance(to, list) else to
+        message['subject'] = subject
+    
+    return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
+
+def send_email_gmail(to, subject, body, is_html=True):
+    """Send email using Gmail API"""
+    try:
+        service = authenticate_gmail()
+        message = create_message(to, subject, body, is_html)
+        sent_message = service.users().messages().send(userId='me', body=message).execute()
+        return sent_message
+    except Exception as e:
+        raise Exception(f"Error sending email: {str(e)}")
 
 # ===== DOCUMENT PROCESSOR CLASS =====
 class DocumentProcessor:
@@ -310,9 +476,6 @@ class DocumentProcessor:
         except Exception as e:
             raise Exception(f"Error loading metadata: {str(e)}")
 
-# Global document processor instance
-doc_processor = DocumentProcessor()
-
 # ===== DATABASE MODELS =====
 class ChatSession:
     @staticmethod
@@ -389,19 +552,450 @@ async def get_chat_history(session_id: str) -> List[dict]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chat history: {str(e)}")
 
-# ===== EVENT HANDLERS =====
-@app.on_event("startup")
-async def startup_events():
-    await connect_to_mongo()
-    doc_processor.load_metadata("./data/metadata")
+# ===== EMAIL AUTOMATION ENDPOINTS =====
 
-@app.on_event("shutdown")
-async def shutdown_events():
-    await close_mongo_connection()
-    os.makedirs("./data", exist_ok=True)
-    doc_processor.save_metadata("./data/metadata")
+@app.post('/gmail-auth')
+async def initialize_gmail_auth():
+    """Initialize Gmail authentication"""
+    try:
+        # This will trigger the OAuth flow
+        service = authenticate_gmail()
+        return JSONResponse({
+            'status': 'success',
+            'message': 'Gmail authentication successful'
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gmail authentication failed: {str(e)}")
+
+@app.post('/email-templates')
+async def create_email_template(template: EmailTemplate):
+    """Create a new email template"""
+    try:
+        template_data = {
+            "name": template.name,
+            "subject": template.subject,
+            "body": template.body,
+            "is_html": template.is_html,
+            "status": "Active"
+        }
+        
+        result = supabase.table('email_templates').insert(template_data).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Email template created successfully',
+                'template': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=400, detail='Failed to create template')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
+
+@app.get('/email-templates')
+async def get_email_templates():
+    """Get all email templates"""
+    try:
+        result = supabase.table('email_templates').select("*").order('created_at', desc=True).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'templates': result.data
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching templates: {str(e)}")
+
+@app.get('/email-templates/{template_id}')
+async def get_email_template(template_id: int):
+    """Get a specific email template"""
+    try:
+        result = supabase.table('email_templates').select("*").eq('id', template_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'template': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Template not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching template: {str(e)}")
+
+@app.put('/email-templates/{template_id}')
+async def update_email_template(template_id: int, template: EmailTemplateUpdate):
+    """Update an email template"""
+    try:
+        update_data = {}
+        if template.name is not None:
+            update_data['name'] = template.name
+        if template.subject is not None:
+            update_data['subject'] = template.subject
+        if template.body is not None:
+            update_data['body'] = template.body
+        if template.is_html is not None:
+            update_data['is_html'] = template.is_html
+        
+        update_data['updated_at'] = datetime.utcnow().isoformat()
+        
+        result = supabase.table('email_templates').update(update_data).eq('id', template_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Template updated successfully',
+                'template': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Template not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating template: {str(e)}")
+
+@app.delete('/email-templates/{template_id}')
+async def delete_email_template(template_id: int):
+    """Delete an email template"""
+    try:
+        result = supabase.table('email_templates').delete().eq('id', template_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Template deleted successfully'
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Template not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting template: {str(e)}")
+
+@app.post('/send-email')
+async def send_single_email(email_data: EmailSend):
+    """Send a single email"""
+    try:
+        # Send email using Gmail API
+        sent_message = send_email_gmail(
+            to=email_data.to,
+            subject=email_data.subject,
+            body=email_data.body,
+            is_html=email_data.is_html
+        )
+        
+        # Log the email in database
+        for recipient in email_data.to:
+            log_data = {
+                "recipient": recipient,
+                "subject": email_data.subject,
+                "body": email_data.body,
+                "status": "Sent",
+                "template_id": email_data.template_id,
+                "message_id": sent_message.get('id')
+            }
+            supabase.table('email_logs').insert(log_data).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'message': f'Email sent to {len(email_data.to)} recipients',
+            'message_id': sent_message.get('id')
+        })
+        
+    except Exception as e:
+        # Log failed email
+        for recipient in email_data.to:
+            log_data = {
+                "recipient": recipient,
+                "subject": email_data.subject,
+                "body": email_data.body,
+                "status": "Failed",
+                "template_id": email_data.template_id,
+                "error_message": str(e)
+            }
+            supabase.table('email_logs').insert(log_data).execute()
+        
+        raise HTTPException(status_code=500, detail=f"Error sending email: {str(e)}")
+
+@app.post('/email-campaigns')
+async def create_email_campaign(campaign: EmailCampaign):
+    """Create and execute email campaign"""
+    try:
+        # Get template
+        template_result = supabase.table('email_templates').select("*").eq('id', campaign.template_id).execute()
+        
+        if not template_result.data:
+            raise HTTPException(status_code=404, detail='Template not found')
+        
+        template = template_result.data[0]
+        
+        # Create campaign record
+        campaign_data = {
+            "name": campaign.name,
+            "template_id": campaign.template_id,
+            "total_recipients": len(campaign.recipient_list),
+            "status": "In Progress"
+        }
+        
+        campaign_result = supabase.table('email_campaigns').insert(campaign_data).execute()
+        campaign_id = campaign_result.data[0]['id']
+        
+        sent_count = 0
+        failed_count = 0
+        
+        # Send emails to all recipients
+        for recipient in campaign.recipient_list:
+            try:
+                sent_message = send_email_gmail(
+                    to=[recipient],
+                    subject=template['subject'],
+                    body=template['body'],
+                    is_html=template['is_html']
+                )
+                
+                # Log successful email
+                log_data = {
+                    "recipient": recipient,
+                    "subject": template['subject'],
+                    "body": template['body'],
+                    "status": "Sent",
+                    "template_id": campaign.template_id,
+                    "campaign_id": campaign_id,
+                    "message_id": sent_message.get('id')
+                }
+                supabase.table('email_logs').insert(log_data).execute()
+                sent_count += 1
+                
+            except Exception as e:
+                # Log failed email
+                log_data = {
+                    "recipient": recipient,
+                    "subject": template['subject'],
+                    "body": template['body'],
+                    "status": "Failed",
+                    "template_id": campaign.template_id,
+                    "campaign_id": campaign_id,
+                    "error_message": str(e)
+                }
+                supabase.table('email_logs').insert(log_data).execute()
+                failed_count += 1
+        
+        # Update campaign with results
+        update_data = {
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "status": "Completed",
+            "completed_at": datetime.utcnow().isoformat()
+        }
+        supabase.table('email_campaigns').update(update_data).eq('id', campaign_id).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'message': f'Campaign completed. Sent: {sent_count}, Failed: {failed_count}',
+            'campaign_id': campaign_id,
+            'sent_count': sent_count,
+            'failed_count': failed_count
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+@app.get('/email-campaigns')
+async def get_email_campaigns():
+    """Get all email campaigns"""
+    try:
+        result = supabase.table('email_campaigns').select("*").order('created_at', desc=True).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'campaigns': result.data
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching campaigns: {str(e)}")
+
+@app.get('/email-logs')
+async def get_email_logs(limit: int = 100):
+    """Get email logs"""
+    try:
+        result = supabase.table('email_logs').select("*").order('sent_at', desc=True).limit(limit).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'logs': result.data
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching logs: {str(e)}")
+
+@app.get('/email-analytics')
+async def get_email_analytics():
+    """Get email analytics"""
+    try:
+        # Get total counts
+        logs_result = supabase.table('email_logs').select("status").execute()
+        campaigns_result = supabase.table('email_campaigns').select("*").execute()
+        
+        logs = logs_result.data
+        campaigns = campaigns_result.data
+        
+        total_sent = sum(1 for log in logs if log['status'] == 'Sent')
+        total_failed = sum(1 for log in logs if log['status'] == 'Failed')
+        total_delivered = total_sent  # Assuming sent = delivered for now
+        total_campaigns = len(campaigns)
+        
+        # Calculate rates (placeholder - you'd need actual tracking for opens/clicks)
+        open_rate = 0.68  # 68%
+        click_rate = 0.13  # 13%
+        
+        estimated_opens = int(total_delivered * open_rate)
+        estimated_clicks = int(total_delivered * click_rate)
+        
+        return JSONResponse({
+            'status': 'success',
+            'analytics': {
+                'total_sent': total_sent + total_failed,
+                'total_delivered': total_delivered,
+                'total_failed': total_failed,
+                'total_opened': estimated_opens,
+                'total_clicked': estimated_clicks,
+                'total_campaigns': total_campaigns,
+                'delivery_rate': round((total_delivered / (total_sent + total_failed) * 100), 2) if (total_sent + total_failed) > 0 else 0,
+                'open_rate': round(open_rate * 100, 2),
+                'click_rate': round(click_rate * 100, 2)
+            }
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching analytics: {str(e)}")
+
+# ===== EMPLOYEE ENDPOINTS =====
+
+@app.post('/employees')
+async def create_employee(employee: EmployeeCreate):
+    """Create a new employee"""
+    try:
+        employee_data = {
+            "name": employee.name,
+            "email": employee.email,
+            "phone": employee.phone,
+            "position": employee.position,
+            "department": employee.department,
+            "status": "Active"
+        }
+        
+        result = supabase.table('employees').insert(employee_data).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Employee created successfully',
+                'employee': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=400, detail='Failed to create employee')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating employee: {str(e)}")
+
+@app.get('/employees')
+async def get_employees():
+    """Get all employees"""
+    try:
+        result = supabase.table('employees').select("*").order('created_at', desc=True).execute()
+        
+        return JSONResponse({
+            'status': 'success',
+            'employees': result.data
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching employees: {str(e)}")
+
+@app.get('/employees/{employee_id}')
+async def get_employee(employee_id: int):
+    """Get a specific employee"""
+    try:
+        result = supabase.table('employees').select("*").eq('id', employee_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'employee': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Employee not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching employee: {str(e)}")
+
+@app.put('/employees/{employee_id}')
+async def update_employee(employee_id: int, employee: EmployeeUpdate):
+    """Update an employee"""
+    try:
+        update_data = {}
+        if employee.name is not None:
+            update_data['name'] = employee.name
+        if employee.email is not None:
+            update_data['email'] = employee.email
+        if employee.phone is not None:
+            update_data['phone'] = employee.phone
+        if employee.position is not None:
+            update_data['position'] = employee.position
+        if employee.department is not None:
+            update_data['department'] = employee.department
+        if employee.status is not None:
+            update_data['status'] = employee.status
+        
+        update_data['updated_at'] = datetime.utcnow().isoformat()
+        
+        result = supabase.table('employees').update(update_data).eq('id', employee_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Employee updated successfully',
+                'employee': result.data[0]
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Employee not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating employee: {str(e)}")
+
+@app.delete('/employees/{employee_id}')
+async def delete_employee(employee_id: int):
+    """Delete an employee"""
+    try:
+        result = supabase.table('employees').delete().eq('id', employee_id).execute()
+        
+        if result.data:
+            return JSONResponse({
+                'status': 'success',
+                'message': 'Employee deleted successfully'
+            })
+        else:
+            raise HTTPException(status_code=404, detail='Employee not found')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting employee: {str(e)}")
+
+@app.post('/employees/bulk-import')
+async def bulk_import_employees(file: UploadFile = File(...)):
+    """Import employees from Excel/CSV file"""
+    try:
+        # This is a placeholder for Excel/CSV import functionality
+        # You would implement the actual Excel parsing here using pandas or openpyxl
+        return JSONResponse({
+            'status': 'success',
+            'message': 'Bulk import functionality - implementation needed',
+            'filename': file.filename
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error importing employees: {str(e)}")
 
 # ===== CHAT ENDPOINTS =====
+
 @app.post('/chat')
 async def chat_endpoint(request: Request):
     data = await request.json()
@@ -492,7 +1086,7 @@ async def chat_endpoint(request: Request):
 
 @app.post('/chat/rag')
 async def rag_chat(request: Request):
-    """RAG-enabled chat endpoint - NO SOURCES RETURNED"""
+    """RAG-enabled chat endpoint"""
     try:
         data = await request.json()
         user_message = data.get('message', '')
@@ -638,6 +1232,7 @@ async def chat_stream(request: Request):
     return StreamingResponse(event_generator(), media_type='text/event-stream')
 
 # ===== DOCUMENT ENDPOINTS =====
+
 @app.post('/upload-document')
 async def upload_document(file: UploadFile = File(...)):
     """Upload and process a document for RAG"""
@@ -720,6 +1315,7 @@ async def search_documents(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ===== IMAGE ENDPOINTS =====
+
 @app.post('/upload-image')
 async def upload_image(file: UploadFile = File(...)):
     """Upload and convert image to base64"""
@@ -735,6 +1331,7 @@ async def upload_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)}")
 
 # ===== SESSION ENDPOINTS =====
+
 @app.get('/chat-sessions/{user_id}')
 async def get_user_chat_sessions(user_id: str):
     """Get all chat sessions for a user"""
@@ -785,6 +1382,7 @@ async def delete_chat_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ===== UTILITY ENDPOINTS =====
+
 @app.get('/models')
 async def get_models():
     """Get available LLM models"""
@@ -803,8 +1401,9 @@ async def health_check():
     return JSONResponse({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
-        'documents_indexed': len(doc_processor.documents),
-        'pinecone_connected': doc_processor.index is not None
+        'documents_indexed': len(doc_processor.documents) if doc_processor else 0,
+        'pinecone_connected': doc_processor.index is not None if doc_processor else False,
+        'gmail_auth_available': os.path.exists(CREDENTIALS_FILE)
     })
 
 # ===== RUN SERVER =====

@@ -40,3 +40,23 @@ if __name__ == "__main__":
     result = analyze_image(IMAGE_URL)
     # Pretty-print the full JSON response
     print(json.dumps(result, indent=2))
+LLM_MODELS = {
+    'daily': {
+        'model': 'gemma2-9b-it',
+        'name': 'Daily Use LLM',
+        'system_prompt': 'You are a helpful assistant for everyday tasks. Provide clear, concise answers.',
+        'supports_vision': False
+    },
+    'image': {
+        'model': 'meta-llama/llama-4-scout-17b-16e-instruct',
+        'name': 'Image Reasoning LLM',
+        'system_prompt': 'You are an expert in image analysis and visual reasoning. Provide detailed insights about images and visual content.',
+        'supports_vision': True
+    },
+    'complex': {
+        'model': 'qwen-qwq-32b',
+        'name': 'Complex Tasks LLM',
+        'system_prompt': 'You are an advanced AI assistant capable of handling complex reasoning, analysis, and problem-solving tasks. Provide thorough, well-reasoned responses.',
+        'supports_vision': False
+    }
+}
