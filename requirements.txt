@@ -16,7 +16,7 @@ python-multipart
 pinecone
 google-generativeai
 supabase
-'pydantic[email]'
+pydantic[email]
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
