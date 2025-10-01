@@ -22,6 +22,8 @@ dist/
 # Temporary files
 *.tmp
 *.bak
-
+data/
+faiss_index/
+files/
 # Sensitive information (example)
 .env

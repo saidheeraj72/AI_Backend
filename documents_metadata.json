@@ -1,6 +1,49 @@
 {
-  "documents": {},
-  "folders": {
-    "root": []
+  "documents": {
+    "Ice_Navigation.pdf": {
+      "filename": "Ice_Navigation.pdf",
+      "directory": "",
+      "chunks_indexed": 44
+    },
+    "files/Incidents_and_Investigations.pdf": {
+      "filename": "Incidents_and_Investigations.pdf",
+      "directory": "files",
+      "chunks_indexed": 87
+    },
+    "files/Cargo_Planning_and_Handling.pdf": {
+      "filename": "Cargo_Planning_and_Handling.pdf",
+      "directory": "files",
+      "chunks_indexed": 4
+    },
+    "files/Management_of_change.pdf": {
+      "filename": "Management_of_change.pdf",
+      "directory": "files",
+      "chunks_indexed": 50
+    },
+    "files/Safety.pdf": {
+      "filename": "Safety.pdf",
+      "directory": "files",
+      "chunks_indexed": 52
+    },
+    "files/Personnel_safety.pdf": {
+      "filename": "Personnel_safety.pdf",
+      "directory": "files",
+      "chunks_indexed": 11
+    },
+    "files/Ice_Navigation.pdf": {
+      "filename": "Ice_Navigation.pdf",
+      "directory": "files",
+      "chunks_indexed": 44
+    },
+    "files/Masters_responsibility.pdf": {
+      "filename": "Masters_responsibility.pdf",
+      "directory": "files",
+      "chunks_indexed": 4
+    },
+    "files/Incidents_and_Investigations-1-10.pdf": {
+      "filename": "Incidents_and_Investigations-1-10.pdf",
+      "directory": "files",
+      "chunks_indexed": 51
+    }
   }
 }

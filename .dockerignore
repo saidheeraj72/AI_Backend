@@ -1,0 +1,13 @@
+.git
+__pycache__
+*.py[cod]
+*.so
+*.log
+logs/
+venv/
+.faiss*
+faiss_index/
+.env
+.env.*
+token.pickle
+credentials.json
