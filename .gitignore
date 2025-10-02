@@ -27,3 +27,4 @@ faiss_index/
 files/
 # Sensitive information (example)
 .env
+k.py
