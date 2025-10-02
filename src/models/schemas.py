@@ -38,3 +38,22 @@ class ChatResponse(BaseModel):
     model_name: str
     response: str
     usage: dict[str, int] | None = None
+
+
+class RAGSource(BaseModel):
+    document: str
+    score: float
+    snippet: str
+
+
+class RAGChatResponse(ChatResponse):
+    question: str
+    sources: list[RAGSource] = Field(default_factory=list)
+
+
+class RAGChatRequest(BaseModel):
+    question: str
+    model_key: str = Field(default="complex")
+    document_paths: list[str] | None = Field(default=None, description="Relative paths of selected documents")
+    use_all: bool = Field(default=False, description="Ignore document_paths and search across all documents")
+    top_k: int = Field(default=4, ge=1, le=20)

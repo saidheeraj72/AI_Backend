@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence, Tuple
 
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -51,6 +51,45 @@ class VectorStoreService:
     def _ensure_index(self) -> None:
         if self.vectorstore is None:
             self.load()
+
+    def search(
+        self,
+        query: str,
+        *,
+        document_paths: Optional[Sequence[str]] = None,
+        top_k: int = 4,
+        oversample: int = 3,
+    ) -> list[Tuple[Document, float]]:
+        """Retrieve the most similar chunks for a query, optionally scoped to selected documents."""
+
+        if not query.strip():
+            raise ValueError("Query must not be empty")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero")
+
+        self._ensure_index()
+        if self.vectorstore is None:
+            raise ValueError("No document index is available. Ingest documents before querying.")
+
+        allowed_sources = {path for path in (document_paths or []) if path}
+
+        sample_size = max(top_k, top_k * max(1, oversample))
+        try:
+            results = self.vectorstore.similarity_search_with_score(query, k=sample_size)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Vector search failed: %s", exc)
+            raise ValueError("Vector search failed") from exc
+
+        if allowed_sources:
+            filtered = [
+                (document, score)
+                for document, score in results
+                if document.metadata.get("source") in allowed_sources
+            ]
+        else:
+            filtered = results
+
+        return filtered[:top_k]
 
     def index_documents(self, documents: Iterable[Document]) -> int:
         """Embed documents and persist them to the FAISS index."""
