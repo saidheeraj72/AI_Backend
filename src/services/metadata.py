@@ -94,3 +94,32 @@ class MetadataService:
     def get_directory_tree(self) -> Dict[str, Any]:
         data = self._load()
         return data.get("directories", {})
+
+    def get_document(self, relative_path: str) -> Optional[Dict[str, Any]]:
+        data = self._load()
+        document = data.get("documents", {}).get(relative_path)
+        if not document:
+            return None
+
+        return {
+            "relative_path": relative_path,
+            **document,
+        }
+
+    def delete_document(self, relative_path: str) -> bool:
+        data = self._load()
+        documents = data.setdefault("documents", {})
+        if relative_path not in documents:
+            return False
+
+        documents.pop(relative_path, None)
+        directories = data.setdefault("directories", {".": {"files": [], "subdirectories": []}})
+
+        for entry in directories.values():
+            files = entry.get("files", [])
+            if relative_path in files:
+                entry["files"] = [item for item in files if item != relative_path]
+
+        self._save(data)
+        self.logger.info("Deleted metadata entry for %s", relative_path)
+        return True

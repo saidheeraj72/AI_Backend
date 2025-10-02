@@ -46,9 +46,8 @@ class ChatResponse(BaseModel):
 
 
 class RAGSource(BaseModel):
-    document: str
-    score: float
-    snippet: str
+    filename: str
+    download_url: str | None = None
 
 
 class RAGChatResponse(ChatResponse):

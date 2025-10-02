@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Optional, Sequence
+
+from supabase import Client, create_client
 
 from src.core.config import Settings
 from src.models.schemas import RAGSource
@@ -29,6 +32,16 @@ class RAGChatService:
         self.llm_service = llm_service
         self.logger = logger or logging.getLogger(__name__)
         self.max_snippet_chars = max_snippet_chars
+        self._supabase_client: Optional[Client] = None
+        self._supabase_bucket = settings.supabase_storage_bucket
+        self._supabase_signed_url_ttl = max(settings.supabase_signed_url_ttl, 1)
+
+        if settings.supabase_url and settings.supabase_key and self._supabase_bucket:
+            try:
+                self._supabase_client = create_client(settings.supabase_url, settings.supabase_key)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to initialize Supabase client for RAG links: %s", exc)
+                self._supabase_client = None
 
     def chat_with_documents(
         self,
@@ -85,12 +98,12 @@ class RAGChatService:
 
         sources: list[RAGSource] = []
         context_sections: list[str] = []
-        for document, score in results:
+        for document, _score in results:
             raw_source = document.metadata.get("source", "unknown")
+            download_url = self._build_download_url(raw_source)
             snippet = self._prepare_snippet(document.page_content)
-            sources.append(
-                RAGSource(document=raw_source, score=float(score), snippet=snippet)
-            )
+            filename = self._extract_filename(raw_source)
+            sources.append(RAGSource(filename=filename, download_url=download_url))
             context_sections.append(
                 f"Source: {raw_source}\nSnippet: {snippet}"
             )
@@ -118,3 +131,34 @@ class RAGChatService:
         if len(collapsed) <= self.max_snippet_chars:
             return collapsed
         return collapsed[: self.max_snippet_chars].rstrip() + "..."
+
+    def _build_download_url(self, relative_path: str) -> Optional[str]:
+        if not relative_path:
+            return None
+
+        normalized = relative_path.lstrip("/")
+
+        if self._supabase_client and self._supabase_bucket:
+            try:
+                bucket = self._supabase_client.storage.from_(self._supabase_bucket)
+                signed = bucket.create_signed_url(
+                    normalized, self._supabase_signed_url_ttl
+                )
+                signed_url = signed.get("signedURL") or signed.get("signedUrl")
+                if signed_url:
+                    return signed_url
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error(
+                    "Failed to create signed URL for %s: %s", normalized, exc
+                )
+
+        if self.settings.supabase_public_storage_base:
+            return f"{self.settings.supabase_public_storage_base}/{normalized}"
+
+        return None
+
+    def _extract_filename(self, relative_path: str) -> str:
+        if not relative_path or relative_path == "unknown":
+            return "unknown"
+
+        return Path(relative_path).name or relative_path

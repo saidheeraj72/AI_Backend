@@ -29,9 +29,17 @@ class Settings:
         self.groq_api_key = os.getenv("GROQ_API_KEY", "")
         self.serper_api_key = os.getenv("SERPER_API_KEY", "")
 
-        self.supabase_url = os.getenv("SUPABASE_URL", "")
+        self.supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
         self.supabase_key = os.getenv("SUPABASE_KEY", "")
         self.supabase_chat_table = os.getenv("SUPABASE_CHAT_TABLE", "chat_history")
+        self.supabase_storage_bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "pdfs")
+        self.supabase_signed_url_ttl = int(os.getenv("SUPABASE_SIGNED_URL_TTL", "3600"))
+        if self.supabase_url and self.supabase_storage_bucket:
+            self.supabase_public_storage_base = (
+                f"{self.supabase_url}/storage/v1/object/public/{self.supabase_storage_bucket}"
+            )
+        else:
+            self.supabase_public_storage_base = ""
 
         origins_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
         methods_env = os.getenv("CORS_ALLOW_METHODS", "*")

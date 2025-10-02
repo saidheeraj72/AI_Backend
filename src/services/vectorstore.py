@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
@@ -112,3 +113,48 @@ class VectorStoreService:
         self.vectorstore.save_local(str(self.index_path))
         self.logger.info("Persisted FAISS index to disk")
         return len(splits)
+
+    def remove_documents(self, sources: Sequence[str]) -> int:
+        """Remove all embeddings associated with the provided source paths."""
+        self._ensure_index()
+        if self.vectorstore is None:
+            self.logger.warning("Vector store not initialized; nothing to remove")
+            return 0
+
+        normalized = {source for source in sources if source}
+        if not normalized:
+            return 0
+
+        try:
+            retain_docs: list[Document] = [
+                doc
+                for doc in self.vectorstore.docstore._dict.values()
+                if doc.metadata.get("source") not in normalized
+            ]
+
+            removed = len(self.vectorstore.docstore._dict) - len(retain_docs)
+            if removed == 0:
+                self.logger.info("No vector records matched sources %s", sorted(normalized))
+                return 0
+
+            if retain_docs:
+                self.vectorstore = FAISS.from_documents(retain_docs, self.embedding_model)
+                self.vectorstore.save_local(str(self.index_path))
+            else:
+                self.vectorstore = None
+                try:
+                    if self.index_path.exists():
+                        if self.index_path.is_dir():
+                            shutil.rmtree(self.index_path)
+                        else:
+                            self.index_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception as cleanup_exc:  # pragma: no cover - defensive logging
+                    self.logger.warning("Failed to clean FAISS index directory: %s", cleanup_exc)
+
+            self.logger.info("Removed %s vector entries for %s", removed, sorted(normalized))
+            return removed
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Failed to remove documents from vector store: %s", exc)
+            raise

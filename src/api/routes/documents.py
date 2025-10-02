@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from typing import Any
+
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from src.core.config import get_settings
 from src.models.schemas import (
@@ -21,7 +24,13 @@ settings = get_settings()
 logger = logging.getLogger("ai_backend.documents")
 pdf_processor = PDFProcessor(logger=logger)
 vector_service = VectorStoreService(settings, logger=logger)
-storage_service = StorageService(settings.pdf_directory, logger=logger)
+storage_service = StorageService(
+    settings.pdf_directory,
+    supabase_url=settings.supabase_url,
+    supabase_key=settings.supabase_key,
+    supabase_bucket=settings.supabase_storage_bucket,
+    logger=logger,
+)
 metadata_service = MetadataService(settings.documents_metadata_path, logger=logger)
 document_ingestor = DocumentIngestor(
     settings=settings,
@@ -63,3 +72,39 @@ async def upload_document(
 async def list_documents() -> DocumentListResponse:
     documents = [DocumentListItem(**item) for item in metadata_service.list_documents()]
     return DocumentListResponse(documents=documents)
+
+
+@router.delete("", response_model=dict[str, Any])
+async def delete_document(relative_path: str = Query(..., description="Relative path of the document to delete")) -> dict[str, Any]:
+    if not relative_path:
+        raise HTTPException(status_code=400, detail="relative_path must be provided")
+
+    document = await run_in_threadpool(metadata_service.get_document, relative_path)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        vectors_removed = await run_in_threadpool(
+            vector_service.remove_documents,
+            [relative_path],
+        )
+        local_deleted = await run_in_threadpool(
+            storage_service.delete_file,
+            relative_path,
+        )
+        metadata_deleted = await run_in_threadpool(
+            metadata_service.delete_document,
+            relative_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Failed to delete document %s: %s", relative_path, exc)
+        raise HTTPException(status_code=500, detail="Failed to delete document") from exc
+
+    return {
+        "relative_path": relative_path,
+        "metadata_deleted": metadata_deleted,
+        "vectors_removed": vectors_removed,
+        "local_deleted": local_deleted,
+    }

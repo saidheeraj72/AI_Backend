@@ -147,7 +147,7 @@ class DocumentIngestor:
                     try:
                         with archive.open(member) as member_file:
                             pdf_data = member_file.read()
-                        saved_path = self.storage_service.save_pdf_bytes(
+                        saved_path = await self.storage_service.save_pdf_bytes(
                             pdf_data, relative_path=member_name
                         )
                     except Exception as exc:  # pragma: no cover - defensive logging
