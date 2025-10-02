@@ -27,6 +27,7 @@ class Settings:
         self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.groq_api_key = os.getenv("GROQ_API_KEY", "")
+        self.serper_api_key = os.getenv("SERPER_API_KEY", "")
 
         self.supabase_url = os.getenv("SUPABASE_URL", "")
         self.supabase_key = os.getenv("SUPABASE_KEY", "")

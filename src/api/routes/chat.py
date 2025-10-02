@@ -21,6 +21,7 @@ from src.services.llm import LLMService
 from src.services.metadata import MetadataService
 from src.services.rag import RAGChatService
 from src.services.vectorstore import VectorStoreService
+from src.services.websearch import WebSearchService
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 rag_router = APIRouter(prefix="/rag", tags=["rag"])
@@ -38,6 +39,7 @@ rag_service = RAGChatService(
     logger=logger,
 )
 chat_history_service = ChatHistoryService(settings, logger=logger)
+websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -49,6 +51,7 @@ async def chat(
     user_id: str = Form(...),
     chat_session_id: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
+    websearch: bool = Form(False),
 ) -> ChatResponse:
     image_bytes: Optional[bytes] = None
     image_mime: Optional[str] = None
@@ -64,11 +67,35 @@ async def chat(
 
     session_id = chat_session_id or str(uuid4())
 
+    if websearch and not prompt:
+        raise HTTPException(status_code=400, detail="websearch requires a text prompt")
+
+    augmented_prompt = prompt
+    if websearch and prompt:
+        try:
+            search_summary = await run_in_threadpool(
+                websearch_service.search_and_summarize,
+                prompt,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Web search failed: %s", exc)
+            search_summary = None
+
+        if search_summary:
+            augmented_prompt = (
+                "Use the following web search summary to answer the question.\n"
+                f"{search_summary}\n\n"
+                "User question: "
+                f"{prompt}"
+            )
+
     try:
         result = await run_in_threadpool(
             llm_service.chat,
             model_key,
-            prompt=prompt,
+            prompt=augmented_prompt,
             image_bytes=image_bytes,
             image_mime_type=image_mime,
         )
