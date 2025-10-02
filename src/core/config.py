@@ -28,6 +28,10 @@ class Settings:
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.groq_api_key = os.getenv("GROQ_API_KEY", "")
 
+        self.supabase_url = os.getenv("SUPABASE_URL", "")
+        self.supabase_key = os.getenv("SUPABASE_KEY", "")
+        self.supabase_chat_table = os.getenv("SUPABASE_CHAT_TABLE", "chat_history")
+
         origins_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
         methods_env = os.getenv("CORS_ALLOW_METHODS", "*")
         headers_env = os.getenv("CORS_ALLOW_HEADERS", "*")
