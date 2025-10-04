@@ -29,7 +29,13 @@ rag_router = APIRouter(prefix="/rag", tags=["rag"])
 settings = get_settings()
 logger = logging.getLogger("ai_backend.chat")
 llm_service = LLMService(settings, logger=logger)
-metadata_service = MetadataService(settings.documents_metadata_path, logger=logger)
+metadata_service = MetadataService(
+    settings.documents_metadata_path,
+    logger=logger,
+    supabase_url=settings.supabase_url,
+    supabase_key=settings.supabase_key,
+    supabase_table=settings.supabase_documents_table,
+)
 vector_service = VectorStoreService(settings, logger=logger)
 rag_service = RAGChatService(
     settings=settings,

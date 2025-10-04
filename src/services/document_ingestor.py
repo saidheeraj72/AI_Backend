@@ -114,7 +114,19 @@ class DocumentIngestor:
                 reason=f"Failed to store PDF: {exc}",
             )
 
-        return self._ingest_saved_pdf(saved_path, upload.filename or saved_path.name)
+        relative_path: Path = Path(saved_path.name)
+        try:
+            try:
+                relative_path = saved_path.relative_to(self.settings.pdf_directory)
+            except ValueError:  # pragma: no cover - defensive logging
+                relative_path = Path(saved_path.name)
+
+            result, error = self._ingest_saved_pdf(
+                saved_path, relative_path, upload.filename or saved_path.name
+            )
+            return result, error
+        finally:
+            self.storage_service.remove_local_copy(relative_path.as_posix())
 
     async def _process_archive_upload(
         self, upload: UploadFile
@@ -162,12 +174,23 @@ class DocumentIngestor:
                         )
                         continue
 
-                    result, error = self._ingest_saved_pdf(saved_path, member_name)
-                    if result:
-                        successes.append(result)
-                        chunks += result.chunks_indexed
-                    if error:
-                        failures.append(error)
+                    relative_path: Path = Path(saved_path.name)
+                    try:
+                        try:
+                            relative_path = saved_path.relative_to(self.settings.pdf_directory)
+                        except ValueError:  # pragma: no cover - defensive logging
+                            relative_path = Path(saved_path.name)
+
+                        result, error = self._ingest_saved_pdf(
+                            saved_path, relative_path, member_name
+                        )
+                        if result:
+                            successes.append(result)
+                            chunks += result.chunks_indexed
+                        if error:
+                            failures.append(error)
+                    finally:
+                        self.storage_service.remove_local_copy(relative_path.as_posix())
         except zipfile.BadZipFile as exc:
             self.logger.exception("Invalid ZIP archive uploaded: %s", upload.filename)
             failures.append(
@@ -180,7 +203,7 @@ class DocumentIngestor:
         return successes, failures, chunks
 
     def _ingest_saved_pdf(
-        self, saved_path: Path, source_label: str
+        self, saved_path: Path, relative_path: Path, source_label: str
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         document = self.pdf_processor.process_pdf(saved_path)
         if document is None:
@@ -188,11 +211,6 @@ class DocumentIngestor:
                 filename=source_label,
                 reason="Could not extract content from PDF",
             )
-
-        try:
-            relative_path = saved_path.relative_to(self.settings.pdf_directory)
-        except ValueError:  # pragma: no cover - defensive logging
-            relative_path = saved_path
 
         document.metadata["source"] = relative_path.as_posix()
 

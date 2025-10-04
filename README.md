@@ -32,6 +32,6 @@ libraries required by `camelot-py[cv]` so PDF table extraction works in containe
 
 - POST `/documents/upload` now accepts a `files` field containing one or more PDFs or ZIP archives of PDFs.
 - Relative paths supplied by the browser (e.g., when uploading a folder) are preserved so nested directories are stored under `PDF_DIRECTORY`.
-- The service tracks ingested files in `DOCUMENTS_METADATA_PATH` (default `documents_metadata.json` at the project root).
+- When `SUPABASE_URL`/`SUPABASE_KEY` are supplied, ingested files are tracked in the Supabase table defined by `SUPABASE_DOCUMENTS_TABLE` (default `documents_metadata`). Otherwise the service falls back to the local JSON file defined by `DOCUMENTS_METADATA_PATH` (default `documents_metadata.json`).
 - Each successful ingest response enumerates processed files, directories, and indexed chunk counts; partial failures are reported alongside successes.
-- GET `/documents/list` reads the metadata JSON and returns the currently indexed documents so the UI can render selectable lists.
+- GET `/documents/list` reads the metadata store (Supabase or JSON fallback) and returns the currently indexed documents so the UI can render selectable lists.

@@ -31,7 +31,13 @@ storage_service = StorageService(
     supabase_bucket=settings.supabase_storage_bucket,
     logger=logger,
 )
-metadata_service = MetadataService(settings.documents_metadata_path, logger=logger)
+metadata_service = MetadataService(
+    settings.documents_metadata_path,
+    logger=logger,
+    supabase_url=settings.supabase_url,
+    supabase_key=settings.supabase_key,
+    supabase_table=settings.supabase_documents_table,
+)
 document_ingestor = DocumentIngestor(
     settings=settings,
     storage_service=storage_service,

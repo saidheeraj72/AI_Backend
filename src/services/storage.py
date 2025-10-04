@@ -132,6 +132,27 @@ class StorageService:
 
         return removed_local
 
+    def remove_local_copy(self, relative_path: str) -> None:
+        """Delete the local copy of a stored document without touching Supabase."""
+        path_obj = Path(relative_path)
+        target_path = (self.base_dir / path_obj).resolve()
+        try:
+            target_path.relative_to(self.base_dir)
+        except ValueError:
+            return
+
+        if target_path.exists():
+            try:
+                target_path.unlink()
+                self._cleanup_empty_dirs(target_path.parent)
+                self.logger.info("Removed local copy of %s", path_obj.as_posix())
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error(
+                    "Failed to remove local copy of %s: %s",
+                    path_obj.as_posix(),
+                    exc,
+                )
+
     def _cleanup_empty_dirs(self, directory: Path) -> None:
         try:
             directory.relative_to(self.base_dir)

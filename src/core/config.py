@@ -33,6 +33,9 @@ class Settings:
         self.supabase_key = os.getenv("SUPABASE_KEY", "")
         self.supabase_chat_table = os.getenv("SUPABASE_CHAT_TABLE", "chat_history")
         self.supabase_storage_bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "pdfs")
+        self.supabase_documents_table = os.getenv(
+            "SUPABASE_DOCUMENTS_TABLE", "documents_metadata"
+        )
         self.supabase_signed_url_ttl = int(os.getenv("SUPABASE_SIGNED_URL_TTL", "3600"))
         if self.supabase_url and self.supabase_storage_bucket:
             self.supabase_public_storage_base = (
