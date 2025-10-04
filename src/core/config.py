@@ -13,14 +13,10 @@ class Settings:
         self.app_name = os.getenv("APP_NAME", "AI Backend Service")
         pdf_directory_default = "data"
         metadata_default = "documents_metadata.json"
-        faiss_index_default = "faiss_index"
 
         self.pdf_directory = (base_dir / os.getenv("PDF_DIRECTORY", pdf_directory_default)).resolve()
         self.documents_metadata_path = (
             base_dir / os.getenv("DOCUMENTS_METADATA_PATH", metadata_default)
-        ).resolve()
-        self.faiss_index_path = (
-            base_dir / os.getenv("FAISS_INDEX_PATH", faiss_index_default)
         ).resolve()
         self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
         self.chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
@@ -38,6 +34,14 @@ class Settings:
         )
         self.supabase_configured = bool(
             self.supabase_url and self.supabase_key and self.supabase_storage_bucket
+        )
+
+        self.pinecone_api_key = os.getenv("PINECONE_API_KEY", "")
+        self.pinecone_index = os.getenv("PINECONE_INDEX", "")
+        self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "")
+        self.pinecone_namespace = os.getenv("PINECONE_NAMESPACE", "")
+        self.pinecone_configured = bool(
+            self.pinecone_api_key and self.pinecone_index
         )
         self.supabase_signed_url_ttl = int(os.getenv("SUPABASE_SIGNED_URL_TTL", "3600"))
         if self.supabase_url and self.supabase_storage_bucket:
@@ -62,7 +66,6 @@ class Settings:
         if not self.supabase_configured:
             self.pdf_directory.mkdir(parents=True, exist_ok=True)
         self.documents_metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        self.faiss_index_path.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache(maxsize=1)

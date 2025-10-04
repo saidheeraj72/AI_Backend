@@ -22,7 +22,7 @@ langchain
 langchain-groq
 langchain-community
 langchain-huggingface
-faiss-cpu
+pinecone
 pdfplumber
 camelot-py[cv]
 sentence-transformers
