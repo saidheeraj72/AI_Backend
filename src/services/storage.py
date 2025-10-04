@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Optional
@@ -11,8 +13,17 @@ from fastapi import UploadFile
 from supabase import Client, create_client
 
 
+@dataclass(slots=True)
+class StoredDocument:
+    """Result of persisting a document for downstream processing."""
+
+    relative_path: Path
+    local_path: Path
+    should_cleanup: bool
+
+
 class StorageService:
-    """Persist uploaded files to the configured data directory."""
+    """Persist uploads to Supabase storage with optional local fallback."""
 
     def __init__(
         self,
@@ -34,15 +45,34 @@ class StorageService:
             except Exception as exc:  # pragma: no cover - defensive logging
                 self.logger.error("Failed to initialize Supabase storage client: %s", exc)
 
-    async def save_pdf(self, upload: UploadFile, *, relative_path: Optional[str] = None) -> Path:
-        """Store an uploaded PDF on disk, preserving optional relative directories."""
+    async def save_pdf(
+        self, upload: UploadFile, *, relative_path: Optional[str] = None
+    ) -> StoredDocument:
+        """Persist an uploaded PDF to Supabase (and optionally disk for fallback)."""
         original_name = upload.filename or "document.pdf"
         target_relative = self._sanitize_relative_path(
             relative_path or original_name, fallback_name=original_name
         )
+        content_type = upload.content_type or "application/pdf"
+
+        if self._supabase_enabled:
+            file_bytes = await upload.read()
+            await upload.close()
+            temp_path = self._write_temp_file(file_bytes)
+            await self._upload_to_supabase_async(
+                temp_path, target_relative, mimetype=content_type
+            )
+            self.logger.info(
+                "Uploaded %s to Supabase storage", target_relative.as_posix()
+            )
+            return StoredDocument(
+                relative_path=target_relative,
+                local_path=temp_path,
+                should_cleanup=True,
+            )
+
         target_path = self._prepare_target_path(target_relative)
         final_relative = target_path.relative_to(self.base_dir)
-        content_type = upload.content_type or "application/pdf"
 
         with target_path.open("wb") as destination:
             while True:
@@ -56,13 +86,35 @@ class StorageService:
         await self._upload_to_supabase_async(
             target_path, final_relative, mimetype=content_type
         )
-        return target_path
+        return StoredDocument(
+            relative_path=final_relative,
+            local_path=target_path,
+            should_cleanup=False,
+        )
 
-    async def save_pdf_bytes(self, data: bytes, *, relative_path: str) -> Path:
+    async def save_pdf_bytes(
+        self, data: bytes, *, relative_path: str
+    ) -> StoredDocument:
         """Persist PDF bytes decoded from archive uploads."""
         target_relative = self._sanitize_relative_path(
             relative_path, fallback_name=relative_path
         )
+
+        if self._supabase_enabled:
+            temp_path = self._write_temp_file(data)
+            await self._upload_to_supabase_async(
+                temp_path, target_relative, mimetype="application/pdf"
+            )
+            self.logger.info(
+                "Uploaded archive member %s to Supabase storage",
+                target_relative.as_posix(),
+            )
+            return StoredDocument(
+                relative_path=target_relative,
+                local_path=temp_path,
+                should_cleanup=True,
+            )
+
         target_path = self._prepare_target_path(target_relative)
         final_relative = target_path.relative_to(self.base_dir)
         await asyncio.to_thread(target_path.write_bytes, data)
@@ -70,7 +122,11 @@ class StorageService:
         await self._upload_to_supabase_async(
             target_path, final_relative, mimetype="application/pdf"
         )
-        return target_path
+        return StoredDocument(
+            relative_path=final_relative,
+            local_path=target_path,
+            should_cleanup=False,
+        )
 
     def _sanitize_relative_path(self, path: str, *, fallback_name: str) -> Path:
         candidate = PurePosixPath(path)
@@ -132,26 +188,23 @@ class StorageService:
 
         return removed_local
 
-    def remove_local_copy(self, relative_path: str) -> None:
-        """Delete the local copy of a stored document without touching Supabase."""
-        path_obj = Path(relative_path)
-        target_path = (self.base_dir / path_obj).resolve()
-        try:
-            target_path.relative_to(self.base_dir)
-        except ValueError:
+    def cleanup_local_path(self, local_path: Path, *, allow_dir_cleanup: bool = False) -> None:
+        """Delete a temporary local file created during ingestion."""
+        if not local_path.exists():
             return
 
-        if target_path.exists():
+        try:
+            local_path.unlink()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to remove local file %s: %s", local_path, exc)
+            return
+
+        if allow_dir_cleanup:
             try:
-                target_path.unlink()
-                self._cleanup_empty_dirs(target_path.parent)
-                self.logger.info("Removed local copy of %s", path_obj.as_posix())
-            except Exception as exc:  # pragma: no cover - defensive logging
-                self.logger.error(
-                    "Failed to remove local copy of %s: %s",
-                    path_obj.as_posix(),
-                    exc,
-                )
+                local_path.parent.relative_to(self.base_dir)
+            except ValueError:
+                return
+            self._cleanup_empty_dirs(local_path.parent)
 
     def _cleanup_empty_dirs(self, directory: Path) -> None:
         try:
@@ -202,3 +255,11 @@ class StorageService:
                 file_obj,
                 {"content-type": mimetype or "application/pdf", "upsert": "true"},
             )
+
+    def _write_temp_file(self, data: bytes) -> Path:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        with temp_file:
+            temp_file.write(data)
+        temp_path = Path(temp_file.name)
+        self.logger.debug("Wrote temporary PDF to %s", temp_path)
+        return temp_path

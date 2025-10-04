@@ -16,7 +16,7 @@ from src.models.schemas import (
 )
 from src.services.metadata import MetadataService
 from src.services.pdf_processor import PDFProcessor
-from src.services.storage import StorageService
+from src.services.storage import StorageService, StoredDocument
 from src.services.vectorstore import VectorStoreService
 
 
@@ -106,7 +106,9 @@ class DocumentIngestor:
         self, upload: UploadFile
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         try:
-            saved_path = await self.storage_service.save_pdf(upload, relative_path=upload.filename)
+            stored = await self.storage_service.save_pdf(
+                upload, relative_path=upload.filename
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.exception("Failed to store uploaded PDF %s", upload.filename)
             return None, DocumentUploadError(
@@ -114,19 +116,17 @@ class DocumentIngestor:
                 reason=f"Failed to store PDF: {exc}",
             )
 
-        relative_path: Path = Path(saved_path.name)
+        relative_path: Path = stored.relative_path
         try:
-            try:
-                relative_path = saved_path.relative_to(self.settings.pdf_directory)
-            except ValueError:  # pragma: no cover - defensive logging
-                relative_path = Path(saved_path.name)
-
             result, error = self._ingest_saved_pdf(
-                saved_path, relative_path, upload.filename or saved_path.name
+                stored.local_path,
+                relative_path,
+                upload.filename or relative_path.name,
             )
             return result, error
         finally:
-            self.storage_service.remove_local_copy(relative_path.as_posix())
+            if stored.should_cleanup:
+                self.storage_service.cleanup_local_path(stored.local_path)
 
     async def _process_archive_upload(
         self, upload: UploadFile
@@ -159,7 +159,7 @@ class DocumentIngestor:
                     try:
                         with archive.open(member) as member_file:
                             pdf_data = member_file.read()
-                        saved_path = await self.storage_service.save_pdf_bytes(
+                        stored_document = await self.storage_service.save_pdf_bytes(
                             pdf_data, relative_path=member_name
                         )
                     except Exception as exc:  # pragma: no cover - defensive logging
@@ -174,15 +174,11 @@ class DocumentIngestor:
                         )
                         continue
 
-                    relative_path: Path = Path(saved_path.name)
                     try:
-                        try:
-                            relative_path = saved_path.relative_to(self.settings.pdf_directory)
-                        except ValueError:  # pragma: no cover - defensive logging
-                            relative_path = Path(saved_path.name)
-
                         result, error = self._ingest_saved_pdf(
-                            saved_path, relative_path, member_name
+                            stored_document.local_path,
+                            stored_document.relative_path,
+                            member_name,
                         )
                         if result:
                             successes.append(result)
@@ -190,7 +186,10 @@ class DocumentIngestor:
                         if error:
                             failures.append(error)
                     finally:
-                        self.storage_service.remove_local_copy(relative_path.as_posix())
+                        if stored_document.should_cleanup:
+                            self.storage_service.cleanup_local_path(
+                                stored_document.local_path
+                            )
         except zipfile.BadZipFile as exc:
             self.logger.exception("Invalid ZIP archive uploaded: %s", upload.filename)
             failures.append(

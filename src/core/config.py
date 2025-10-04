@@ -36,6 +36,9 @@ class Settings:
         self.supabase_documents_table = os.getenv(
             "SUPABASE_DOCUMENTS_TABLE", "documents_metadata"
         )
+        self.supabase_configured = bool(
+            self.supabase_url and self.supabase_key and self.supabase_storage_bucket
+        )
         self.supabase_signed_url_ttl = int(os.getenv("SUPABASE_SIGNED_URL_TTL", "3600"))
         if self.supabase_url and self.supabase_storage_bucket:
             self.supabase_public_storage_base = (
@@ -49,11 +52,15 @@ class Settings:
         headers_env = os.getenv("CORS_ALLOW_HEADERS", "*")
 
         self.cors_allow_origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()] or ["*"]
+        vercel_origin = "https://smart-biz-desk.vercel.app"
+        if "*" not in self.cors_allow_origins and vercel_origin not in self.cors_allow_origins:
+            self.cors_allow_origins.append(vercel_origin)
         self.cors_allow_methods = [method.strip().upper() for method in methods_env.split(",") if method.strip()] or ["*"]
         self.cors_allow_headers = [header.strip() for header in headers_env.split(",") if header.strip()] or ["*"]
         self.cors_allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
 
-        self.pdf_directory.mkdir(parents=True, exist_ok=True)
+        if not self.supabase_configured:
+            self.pdf_directory.mkdir(parents=True, exist_ok=True)
         self.documents_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         self.faiss_index_path.mkdir(parents=True, exist_ok=True)
 
