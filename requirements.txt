@@ -14,3 +14,4 @@ pdfplumber
 camelot-py[cv]
 sentence-transformers
 numpy
+PyPDF2
