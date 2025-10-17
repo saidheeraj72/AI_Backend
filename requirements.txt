@@ -4,6 +4,7 @@ groq
 python-dotenv
 pydantic
 python-multipart
+pyjwt
 supabase
 langchain
 langchain-groq

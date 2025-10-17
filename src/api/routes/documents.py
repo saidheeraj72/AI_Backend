@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
+from src.api.dependencies.auth import require_supabase_user
 from src.core.config import get_settings
 from src.models.schemas import (
     DocumentIngestResponse,
@@ -18,7 +19,11 @@ from src.services.pdf_processor import PDFProcessor
 from src.services.storage import StorageService
 from src.services.vectorstore import VectorStoreService
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+router = APIRouter(
+    prefix="/documents",
+    tags=["documents"],
+    dependencies=[Depends(require_supabase_user)],
+)
 
 settings = get_settings()
 logger = logging.getLogger("ai_backend.documents")
@@ -81,7 +86,9 @@ async def list_documents() -> DocumentListResponse:
 
 
 @router.delete("", response_model=dict[str, Any])
-async def delete_document(relative_path: str = Query(..., description="Relative path of the document to delete")) -> dict[str, Any]:
+async def delete_document(
+    relative_path: str = Query(..., description="Relative path of the document to delete"),
+) -> dict[str, Any]:
     if not relative_path:
         raise HTTPException(status_code=400, detail="relative_path must be provided")
 

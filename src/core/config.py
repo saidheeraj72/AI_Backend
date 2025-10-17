@@ -4,6 +4,10 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 class Settings:
     """Application configuration loaded from environment variables."""
@@ -27,6 +31,7 @@ class Settings:
 
         self.supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
         self.supabase_key = os.getenv("SUPABASE_KEY", "")
+        self.supabase_jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
         self.supabase_chat_table = os.getenv("SUPABASE_CHAT_TABLE", "chat_history")
         self.supabase_storage_bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "pdfs")
         self.supabase_documents_table = os.getenv(

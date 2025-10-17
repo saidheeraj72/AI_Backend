@@ -2,6 +2,11 @@
 
 FastAPI backend that orchestrates document processing, RAG search, and email automations.
 
+## Authentication
+
+- Requests to chat, RAG, document, and history endpoints must include a Supabase access token in the `Authorization: Bearer <token>` header.
+- Configure `SUPABASE_JWT_SECRET` in the environment so the backend can validate Supabase-issued JWTs. Tokens that fail validation or use a different Supabase user are rejected with `401/403` responses.
+
 ## Docker Deployment
 
 The repository provides a production-friendly Docker image that bundles Ghostscript and the native

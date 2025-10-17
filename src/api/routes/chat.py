@@ -4,9 +4,10 @@ import logging
 from typing import Optional, Union
 from uuid import uuid4
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
+from src.api.dependencies.auth import SupabaseUser, require_supabase_user
 from src.core.config import get_settings
 from src.models.schemas import (
     ChatHistoryResponse,
@@ -50,6 +51,11 @@ websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
 
+def _ensure_user_access(current_user: SupabaseUser, requested_user_id: str) -> None:
+    if current_user.id != requested_user_id:
+        raise HTTPException(status_code=403, detail="Authenticated user mismatch")
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(
     model_key: str = Form(...),
@@ -58,6 +64,7 @@ async def chat(
     chat_session_id: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
     websearch: bool = Form(False),
+    current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> ChatResponse:
     image_bytes: Optional[bytes] = None
     image_mime: Optional[str] = None
@@ -75,6 +82,8 @@ async def chat(
 
     if websearch and not prompt:
         raise HTTPException(status_code=400, detail="websearch requires a text prompt")
+
+    _ensure_user_access(current_user, user_id)
 
     augmented_prompt = prompt
     if websearch and prompt:
@@ -144,9 +153,12 @@ async def chat_history(
         None, description="Conversation identifier to retrieve when scope=session"
     ),
     limit: Optional[int] = Query(None, ge=1, le=500, description="Optional limit for session messages"),
+    current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> Union[ChatHistoryResponse, ChatSessionListResponse]:
     if not chat_history_service.enabled:
         raise HTTPException(status_code=503, detail="Chat history storage is not configured")
+
+    _ensure_user_access(current_user, user_id)
 
     if scope is ChatHistoryScope.sessions:
         try:
@@ -188,9 +200,12 @@ async def chat_history(
 async def delete_chat_history(
     user_id: str = Query(..., description="Supabase auth identifier for the requesting user"),
     chat_session_id: str = Query(..., description="Conversation identifier to delete"),
+    current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> dict[str, Union[str, int]]:
     if not chat_history_service.enabled:
         raise HTTPException(status_code=503, detail="Chat history storage is not configured")
+
+    _ensure_user_access(current_user, user_id)
 
     try:
         deleted_count = await run_in_threadpool(
@@ -251,10 +266,18 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
 
 
 @router.post("/rag", response_model=RAGChatResponse)
-async def rag_chat(request: RAGChatRequest) -> RAGChatResponse:
+async def rag_chat(
+    request: RAGChatRequest,
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> RAGChatResponse:
+    _ensure_user_access(current_user, request.user_id)
     return await _handle_rag_chat(request)
 
 
 @rag_router.post("", response_model=RAGChatResponse)
-async def rag_chat_root(request: RAGChatRequest) -> RAGChatResponse:
+async def rag_chat_root(
+    request: RAGChatRequest,
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> RAGChatResponse:
+    _ensure_user_access(current_user, request.user_id)
     return await _handle_rag_chat(request)

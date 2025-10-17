@@ -42,7 +42,7 @@ class LLMService:
 
         self.logger = logger or logging.getLogger(__name__)
         self.settings = settings
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.client = Groq(api_key=settings.groq_api_key)
 
     def _build_messages(
         self,
