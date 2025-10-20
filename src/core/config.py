@@ -23,6 +23,11 @@ class Settings:
             base_dir / os.getenv("DOCUMENTS_METADATA_PATH", metadata_default)
         ).resolve()
         self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
+        self.embedding_model_device = os.getenv("EMBEDDING_MODEL_DEVICE", "cpu")
+        self.embedding_query_instruction = os.getenv(
+            "EMBEDDING_QUERY_INSTRUCTION",
+            "为这个句子生成表示以用于检索相关文章：",
+        )
         self.chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
         self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
         self.log_level = os.getenv("LOG_LEVEL", "INFO")

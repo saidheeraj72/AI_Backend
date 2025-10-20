@@ -8,9 +8,9 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     Pinecone = None
 
-from langchain.docstore.document import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_text_splitters.character import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from src.core.config import Settings
 
 
@@ -20,11 +20,14 @@ class VectorStoreService:
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.settings = settings
         self.logger = logger or logging.getLogger(__name__)
-        self.embedding_model = HuggingFaceEmbeddings(
+        self.embedding_model = HuggingFaceBgeEmbeddings(
             model_name=self.settings.embedding_model_name,
-            model_kwargs={"device": "cpu"},
+            model_kwargs={"device": self.settings.embedding_model_device},
             encode_kwargs={"normalize_embeddings": True},
+            query_instruction=self.settings.embedding_query_instruction,
         )
+        # The query instruction must also be set on the instance for backward compatibility.
+        self.embedding_model.query_instruction = self.settings.embedding_query_instruction
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap,

@@ -1,81 +1,70 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Mapping, Optional
 
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from src.core.config import Settings, get_settings
-
-auth_scheme = HTTPBearer(auto_error=False)
+from src.core.config import get_settings
 
 
-@dataclass
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+@dataclass(frozen=True)
 class SupabaseUser:
-    """Represents an authenticated Supabase user."""
+    """Lightweight representation of the authenticated Supabase user."""
 
     id: str
-    claims: Dict[str, Any]
+    email: Optional[str]
+    role: Optional[str]
+    claims: Mapping[str, Any]
 
 
-def require_supabase_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(auth_scheme),
-    settings: Settings = Depends(get_settings),
-) -> SupabaseUser:
-    """Validate the Supabase access token from the Authorization header."""
-
-    if not settings.supabase_jwt_secret:
+def _decode_supabase_token(token: str, *, secret: str) -> Mapping[str, Any]:
+    if not secret:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Supabase JWT secret is not configured on the server",
+            detail="Supabase JWT secret is not configured",
         )
 
-    unauthorized_headers = {"WWW-Authenticate": "Bearer"}
-
-    if credentials is None or not credentials.scheme or not credentials.credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization credentials were not provided",
-            headers=unauthorized_headers,
-        )
-
-    if credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header must use Bearer scheme",
-            headers=unauthorized_headers,
-        )
-
-    token = credentials.credentials
-
+    secret = secret.strip().strip('"')
     try:
-        claims = jwt.decode(
+        return jwt.decode(
             token,
-            settings.supabase_jwt_secret,
+            secret,
             algorithms=["HS256"],
             options={"verify_aud": False},
         )
     except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access token has expired",
-            headers=unauthorized_headers,
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Supabase token expired") from exc
     except jwt.InvalidTokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid access token",
-            headers=unauthorized_headers,
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Supabase token") from exc
 
-    user_id = str(claims.get("sub") or claims.get("user_id") or "").strip()
+
+def _build_user_from_claims(claims: Mapping[str, Any]) -> SupabaseUser:
+    user_id = claims.get("sub") or claims.get("user_id")
     if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access token does not include a user identifier",
-            headers=unauthorized_headers,
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Supabase token missing user id")
 
-    return SupabaseUser(id=user_id, claims=claims)
+    email = claims.get("email") or claims.get("user_metadata", {}).get("email")
+    role = claims.get("role") or claims.get("app_metadata", {}).get("role")
+
+    return SupabaseUser(id=str(user_id), email=email, role=role, claims=claims)
+
+
+async def require_supabase_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> SupabaseUser:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header")
+
+    token = credentials.credentials.strip()
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Supabase token is required")
+
+    settings = get_settings()
+    claims = _decode_supabase_token(token, secret=settings.supabase_jwt_secret)
+    return _build_user_from_claims(claims)

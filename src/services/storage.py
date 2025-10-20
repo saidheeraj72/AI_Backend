@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -59,16 +60,30 @@ class StorageService:
             file_bytes = await upload.read()
             await upload.close()
             temp_path = self._write_temp_file(file_bytes)
-            await self._upload_to_supabase_async(
+            if await self._upload_to_supabase_async(
                 temp_path, target_relative, mimetype=content_type
+            ):
+                self.logger.info(
+                    "Uploaded %s to Supabase storage", target_relative.as_posix()
+                )
+                return StoredDocument(
+                    relative_path=target_relative,
+                    local_path=temp_path,
+                    should_cleanup=True,
+                )
+
+            self.logger.warning(
+                "Supabase upload failed for %s; falling back to local storage",
+                target_relative.as_posix(),
             )
-            self.logger.info(
-                "Uploaded %s to Supabase storage", target_relative.as_posix()
-            )
+            target_path = self._prepare_target_path(target_relative)
+            await asyncio.to_thread(shutil.copyfile, temp_path, target_path)
+            self.cleanup_local_path(temp_path)
+            final_relative = target_path.relative_to(self.base_dir)
             return StoredDocument(
-                relative_path=target_relative,
-                local_path=temp_path,
-                should_cleanup=True,
+                relative_path=final_relative,
+                local_path=target_path,
+                should_cleanup=False,
             )
 
         target_path = self._prepare_target_path(target_relative)
@@ -102,17 +117,31 @@ class StorageService:
 
         if self._supabase_enabled:
             temp_path = self._write_temp_file(data)
-            await self._upload_to_supabase_async(
+            if await self._upload_to_supabase_async(
                 temp_path, target_relative, mimetype="application/pdf"
-            )
-            self.logger.info(
-                "Uploaded archive member %s to Supabase storage",
+            ):
+                self.logger.info(
+                    "Uploaded archive member %s to Supabase storage",
+                    target_relative.as_posix(),
+                )
+                return StoredDocument(
+                    relative_path=target_relative,
+                    local_path=temp_path,
+                    should_cleanup=True,
+                )
+
+            self.logger.warning(
+                "Supabase upload failed for archive member %s; using local storage fallback",
                 target_relative.as_posix(),
             )
+            target_path = self._prepare_target_path(target_relative)
+            await asyncio.to_thread(target_path.write_bytes, data)
+            self.cleanup_local_path(temp_path)
+            final_relative = target_path.relative_to(self.base_dir)
             return StoredDocument(
-                relative_path=target_relative,
-                local_path=temp_path,
-                should_cleanup=True,
+                relative_path=final_relative,
+                local_path=target_path,
+                should_cleanup=False,
             )
 
         target_path = self._prepare_target_path(target_relative)
@@ -225,9 +254,9 @@ class StorageService:
 
     async def _upload_to_supabase_async(
         self, file_path: Path, relative_path: Path, *, mimetype: str
-    ) -> None:
+    ) -> bool:
         if not self._supabase_enabled:
-            return
+            return False
 
         try:
             await asyncio.to_thread(
@@ -236,12 +265,14 @@ class StorageService:
                 relative_path.as_posix(),
                 mimetype,
             )
+            return True
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.error(
                 "Failed to upload %s to Supabase storage: %s",
                 relative_path.as_posix(),
                 exc,
             )
+            return False
 
     def _upload_to_supabase(self, file_path: Path, storage_path: str, mimetype: str) -> None:
         if not self._supabase_enabled:

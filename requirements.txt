@@ -11,8 +11,8 @@ langchain-groq
 langchain-community
 langchain-huggingface
 pinecone
+FlagEmbedding
 pdfplumber
 camelot-py[cv]
-sentence-transformers
 numpy
 PyPDF2
