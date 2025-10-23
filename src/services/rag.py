@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence
 
 from supabase import Client, create_client
@@ -54,23 +54,64 @@ class RAGChatService:
         if not question or not question.strip():
             raise ValueError("Question must not be empty")
 
-        available_documents = {
-            item["relative_path"] for item in self.metadata_service.list_documents()
-        }
-        if not available_documents:
+        document_records = self.metadata_service.list_documents()
+        if not document_records:
             raise ValueError("No documents are available. Please ingest documents before chatting.")
 
-        if document_paths is not None and not document_paths:
-            raise ValueError("Select at least one document or enable use_all")
+        normalized_to_original: dict[str, str] = {}
+        directory_to_docs: dict[str, list[str]] = {}
+        for record in document_records:
+            relative_path = record.get("relative_path")
+            if not relative_path:
+                continue
+            normalized_path = _normalize_relative_path(relative_path)
+            normalized_to_original[normalized_path] = relative_path
+
+            parent = PurePosixPath(normalized_path).parent
+            directory_key = _normalize_relative_path(parent.as_posix())
+            directory_to_docs.setdefault(directory_key, []).append(relative_path)
+
+        if not normalized_to_original:
+            raise ValueError("No documents are available. Please ingest documents before chatting.")
 
         allowed_paths = None
-        if document_paths:
-            invalid = sorted(set(document_paths) - available_documents)
-            if invalid:
+        if document_paths is not None:
+            if not document_paths:
+                raise ValueError("Select at least one document or enable use_all")
+
+            resolved_paths: list[str] = []
+            unknown_entries: list[str] = []
+
+            for entry in document_paths:
+                normalized_entry = _normalize_relative_path(entry)
+
+                if normalized_entry in normalized_to_original:
+                    resolved_paths.append(normalized_to_original[normalized_entry])
+                    continue
+
+                directory_docs = directory_to_docs.get(normalized_entry, [])
+                if directory_docs:
+                    resolved_paths.extend(directory_docs)
+                    continue
+
+                unknown_entries.append(entry)
+
+            if unknown_entries:
                 raise ValueError(
-                    f"Unknown documents requested: {', '.join(invalid)}"
+                    "Unknown documents selected: "
+                    + ", ".join(sorted(set(unknown_entries)))
                 )
-            allowed_paths = list(dict.fromkeys(document_paths))
+
+            if not resolved_paths:
+                raise ValueError("No valid documents found for the selected folders.")
+
+            # Preserve order while removing duplicates
+            seen: set[str] = set()
+            allowed_paths = []
+            for path in resolved_paths:
+                if path not in seen:
+                    seen.add(path)
+                    allowed_paths.append(path)
 
         results = self.vector_service.search(
             question,
@@ -162,3 +203,15 @@ class RAGChatService:
             return "unknown"
 
         return Path(relative_path).name or relative_path
+
+
+def _normalize_relative_path(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    candidate = PurePosixPath(path)
+    parts = [
+        segment
+        for segment in candidate.parts
+        if segment not in {"", ".", ".."}
+    ]
+    return "/".join(parts)
