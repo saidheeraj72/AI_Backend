@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from pathlib import PurePosixPath
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from src.api.dependencies.auth import require_supabase_user
@@ -57,6 +58,7 @@ document_ingestor = DocumentIngestor(
 async def upload_document(
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
+    relative_paths: list[str] | None = Form(default=None),
 ) -> DocumentIngestResponse:
     uploads: list[UploadFile] = []
     if files:
@@ -66,6 +68,21 @@ async def upload_document(
 
     if not uploads:
         raise HTTPException(status_code=400, detail="At least one file must be provided")
+
+    sanitized_paths: list[str] = []
+    if relative_paths is not None:
+        if len(relative_paths) != len(uploads):
+            raise HTTPException(
+                status_code=400,
+                detail="Number of relative_paths entries must match uploaded files",
+            )
+        for provided_path in relative_paths:
+            normalized = _normalize_relative_path(provided_path)
+            sanitized_paths.append(normalized)
+
+        for upload, normalized in zip(uploads, sanitized_paths, strict=False):
+            if normalized:
+                upload.filename = normalized
 
     try:
         return await document_ingestor.ingest_uploads(uploads)
@@ -80,8 +97,22 @@ async def upload_document(
 
 
 @router.get("/list", response_model=DocumentListResponse)
-async def list_documents() -> DocumentListResponse:
+async def list_documents(
+    directory: str | None = Query(
+        default=None, description="Filter documents by their directory path"
+    ),
+) -> DocumentListResponse:
+    directory_filter = _normalize_relative_path(directory) if directory else None
+
     documents = [DocumentListItem(**item) for item in metadata_service.list_documents()]
+
+    if directory_filter is not None:
+        documents = [
+            document
+            for document in documents
+            if _directory_matches_filter(_normalize_relative_path(document.directory), directory_filter)
+        ]
+
     return DocumentListResponse(documents=documents)
 
 
@@ -121,3 +152,93 @@ async def delete_document(
         "vectors_removed": vectors_removed,
         "local_deleted": local_deleted,
     }
+
+
+@router.delete(
+    "/directory",
+    response_model=dict[str, Any],
+    summary="Delete all documents within a directory",
+)
+async def delete_directory(
+    directory: str = Query(..., description="Directory whose documents should be deleted"),
+) -> dict[str, Any]:
+    normalized_directory = _normalize_relative_path(directory)
+    documents = [DocumentListItem(**item) for item in metadata_service.list_documents()]
+
+    target_paths = [
+        document.relative_path
+        for document in documents
+        if _directory_matches_filter(
+            _normalize_relative_path(document.directory),
+            normalized_directory,
+        )
+    ]
+
+    if not target_paths:
+        raise HTTPException(
+            status_code=404,
+            detail="No documents found in the specified directory",
+        )
+
+    try:
+        vectors_removed = await run_in_threadpool(
+            vector_service.remove_documents,
+            target_paths,
+        )
+
+        storage_results: list[bool] = []
+        metadata_results: list[bool] = []
+
+        for relative_path in target_paths:
+            storage_deleted = await run_in_threadpool(
+                storage_service.delete_file,
+                relative_path,
+            )
+            storage_results.append(storage_deleted)
+
+        for relative_path in target_paths:
+            metadata_deleted = await run_in_threadpool(
+                metadata_service.delete_document,
+                relative_path,
+            )
+            metadata_results.append(metadata_deleted)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Failed to delete documents in directory %s: %s",
+            normalized_directory,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete documents in directory",
+        ) from exc
+
+    return {
+        "directory": normalized_directory,
+        "documents_requested": len(target_paths),
+        "vectors_removed": vectors_removed,
+        "storage_deleted": sum(storage_results),
+        "metadata_deleted": sum(metadata_results),
+        "relative_paths": target_paths,
+    }
+
+
+def _normalize_relative_path(path: str | None) -> str:
+    if not path:
+        return ""
+    parts = [
+        segment
+        for segment in PurePosixPath(path).parts
+        if segment not in {"", ".", ".."}
+    ]
+    return "/".join(parts)
+
+
+def _directory_matches_filter(document_directory: str, directory_filter: str) -> bool:
+    if directory_filter == "":
+        return document_directory == ""
+    if document_directory == directory_filter:
+        return True
+    return document_directory.startswith(f"{directory_filter}/")
