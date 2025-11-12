@@ -7,7 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes.chat import rag_router, router as chat_router
+from src.api.routes.config import router as config_router
 from src.api.routes.documents import router as documents_router
+from src.api.routes.settings import router as settings_router
 from src.core.config import get_settings
 
 settings = get_settings()
@@ -49,6 +51,8 @@ def create_app() -> FastAPI:
     application.include_router(chat_router)
     application.include_router(rag_router)
     application.include_router(documents_router)
+    application.include_router(config_router)
+    application.include_router(settings_router)
 
     @application.get("/health")
     async def health_check() -> dict[str, str]:

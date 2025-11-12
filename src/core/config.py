@@ -36,6 +36,7 @@ class Settings:
 
         self.supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
         self.supabase_key = os.getenv("SUPABASE_KEY", "")
+        self.supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "")
         self.supabase_jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
         self.supabase_chat_table = os.getenv("SUPABASE_CHAT_TABLE", "chat_history")
         self.supabase_storage_bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "pdfs")

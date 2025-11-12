@@ -50,11 +50,12 @@ class RAGChatService:
         question: str,
         document_paths: Optional[Sequence[str]],
         top_k: int,
+        document_records: Optional[Sequence[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         if not question or not question.strip():
             raise ValueError("Question must not be empty")
 
-        document_records = self.metadata_service.list_documents()
+        document_records = list(document_records or self.metadata_service.list_documents())
         if not document_records:
             raise ValueError("No documents are available. Please ingest documents before chatting.")
 

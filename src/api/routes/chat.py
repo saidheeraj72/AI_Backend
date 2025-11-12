@@ -21,8 +21,10 @@ from src.services.chat_history import ChatHistoryService
 from src.services.llm import LLMService
 from src.services.metadata import MetadataService
 from src.services.rag import RAGChatService
+from src.services.document_access import build_document_access_snapshot, validate_requested_paths
 from src.services.vectorstore import VectorStoreService
 from src.services.websearch import WebSearchService
+from src.services.settings_manager import SettingsManager
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 rag_router = APIRouter(prefix="/rag", tags=["rag"])
@@ -47,6 +49,7 @@ rag_service = RAGChatService(
 )
 chat_history_service = ChatHistoryService(settings, logger=logger)
 websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
+settings_manager = SettingsManager(settings=settings, logger=logger)
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -223,8 +226,42 @@ async def delete_chat_history(
 
 
 async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
-    selected_documents = None if request.use_all else request.document_paths
     session_id = request.chat_session_id or str(uuid4())
+
+    profile = settings_manager.get_user_access_profile(request.user_id)
+    raw_documents = metadata_service.list_documents()
+    access_snapshot = build_document_access_snapshot(raw_documents, profile)
+
+    if not access_snapshot.documents:
+        raise HTTPException(status_code=403, detail="You do not have access to any documents.")
+
+    if request.use_all:
+        all_paths = [
+            str(record.get("relative_path"))
+            for record in access_snapshot.documents
+            if record.get("relative_path")
+        ]
+        if not all_paths:
+            raise HTTPException(status_code=403, detail="You do not have access to any documents.")
+        selected_documents = list(dict.fromkeys(all_paths))
+    else:
+        requested_paths = request.document_paths or []
+        if not requested_paths:
+            raise HTTPException(status_code=400, detail="Select at least one document or enable use_all")
+
+        allowed_paths, denied_paths = validate_requested_paths(requested_paths, access_snapshot)
+        if denied_paths:
+            raise HTTPException(
+                status_code=403,
+                detail=
+                "You do not have permission to use the selected documents: "
+                + ", ".join(sorted(set(denied_paths))[:5]),
+            )
+
+        if not allowed_paths:
+            raise HTTPException(status_code=400, detail="No valid documents found for the selected folders.")
+
+        selected_documents = list(dict.fromkeys(allowed_paths))
 
     try:
         result = await run_in_threadpool(
@@ -233,6 +270,7 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
             question=request.question,
             document_paths=selected_documents,
             top_k=request.top_k,
+            document_records=access_snapshot.documents,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
