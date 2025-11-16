@@ -60,7 +60,13 @@ class MetadataService:
             return
         self.metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    def record_document(self, relative_path: Path, chunks_indexed: int) -> None:
+    def record_document(
+        self,
+        relative_path: Path,
+        chunks_indexed: int,
+        branch_id: Optional[str] = None,
+        branch_name: Optional[str] = None,
+    ) -> None:
         if self._supabase_enabled:
             relative_key = relative_path.as_posix()
             directory_key = relative_path.parent.as_posix()
@@ -70,6 +76,12 @@ class MetadataService:
                 "directory": directory_key if directory_key != "." else "",
                 "chunks_indexed": chunks_indexed,
             }
+
+            # Add branch information if provided
+            if branch_id is not None:
+                payload["branch_id"] = branch_id
+            if branch_name is not None:
+                payload["branch_name"] = branch_name
 
             try:
                 assert self._supabase_client is not None
@@ -126,7 +138,7 @@ class MetadataService:
                 assert self._supabase_client is not None
                 response = (
                     self._supabase_client.table(self._supabase_table)
-                    .select("relative_path, filename, directory, chunks_indexed")
+                    .select("relative_path, filename, directory, chunks_indexed, branch_id, branch_name")
                     .order("relative_path")
                     .execute()
                 )
@@ -143,12 +155,16 @@ class MetadataService:
                 filename = record.get("filename") or Path(relative_path).name
                 directory = record.get("directory") or ""
                 chunks_indexed = int(record.get("chunks_indexed") or 0)
+                branch_id = record.get("branch_id")
+                branch_name = record.get("branch_name")
                 items.append(
                     {
                         "filename": filename,
                         "relative_path": relative_path,
                         "directory": directory,
                         "chunks_indexed": chunks_indexed,
+                        "branch_id": branch_id,
+                        "branch_name": branch_name,
                     }
                 )
 
@@ -185,7 +201,7 @@ class MetadataService:
                 assert self._supabase_client is not None
                 response = (
                     self._supabase_client.table(self._supabase_table)
-                    .select("relative_path, filename, directory, chunks_indexed")
+                    .select("relative_path, filename, directory, chunks_indexed, branch_id, branch_name")
                     .eq("relative_path", relative_path)
                     .limit(1)
                     .execute()
@@ -204,6 +220,8 @@ class MetadataService:
                 "filename": record.get("filename", Path(relative_path).name),
                 "directory": record.get("directory", ""),
                 "chunks_indexed": int(record.get("chunks_indexed") or 0),
+                "branch_id": record.get("branch_id"),
+                "branch_name": record.get("branch_name"),
             }
 
         data = self._load()

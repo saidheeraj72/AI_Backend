@@ -110,6 +110,12 @@ async def get_settings_data(current_user: SupabaseUser = Depends(require_supabas
     directories = _collect_unique_directories()
     folder_tree = _build_folder_tree()
 
+    # Get branches list
+    try:
+        branches = settings_manager.list_branches()
+    except Exception:
+        branches = []
+
     return {
         "user_role": user_role,
         "group_members": group_members,
@@ -117,6 +123,7 @@ async def get_settings_data(current_user: SupabaseUser = Depends(require_supabas
         "group_folder_permissions": group_folder_permissions,
         "folders": directories,
         "folder_tree": folder_tree,
+        "branches": branches,
     }
 
 
@@ -179,6 +186,8 @@ async def add_user_to_groups(
     role = payload.get("role")
     group_ids = payload.get("group_ids") or []
     folder_paths = payload.get("folder_paths") or []
+    branch_id = payload.get("branch_id")
+    branch_name = payload.get("branch_name")
 
     if not isinstance(email, str) or not email.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is required")
@@ -195,6 +204,8 @@ async def add_user_to_groups(
             group_ids=group_ids,
             folder_paths=folder_paths,
             acting_user_id=current_user.id,
+            branch_id=str(branch_id) if branch_id else None,
+            branch_name=str(branch_name) if branch_name else None,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -459,3 +470,51 @@ async def remove_user_from_group(
         ) from exc
 
     return {"status": "ok"}
+
+
+@router.get("/branches", response_model=dict[str, Any])
+async def list_branches(
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, Any]:
+    """List all branches"""
+    try:
+        branches = settings_manager.list_branches()
+        return {"branches": branches}
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc)
+        ) from exc
+
+
+@router.post("/branches", response_model=dict[str, Any])
+async def create_branch(
+    payload: dict[str, Any],
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, Any]:
+    """Create a new branch (superadmin only)"""
+    user_role = settings_manager.get_user_role(current_user.id)
+    if user_role != "superadmin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superadmins can create branches"
+        )
+
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Branch name is required"
+        )
+
+    try:
+        branch_id = settings_manager.create_branch(name=name.strip())
+        return {
+            "branch_id": branch_id,
+            "message": f"Branch '{name}' created successfully"
+        }
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc)
+        ) from exc

@@ -65,6 +65,8 @@ async def upload_document(
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     relative_paths: list[str] | None = Form(default=None),
+    branch_id: str | None = Form(default=None),
+    branch_name: str | None = Form(default=None),
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> DocumentIngestResponse:
     # Check user permissions
@@ -122,8 +124,16 @@ async def upload_document(
                     detail=f"You do not have upload permission for document '{filename}'. Contact your administrator to grant access."
                 )
 
+    # Determine which branch to use
+    # For superadmins: use the branch from the request (allows uploading to any branch)
+    # For admins/users: use their assigned branch from profile
+    upload_branch_id = branch_id if is_superadmin else profile.branch_id
+    upload_branch_name = branch_name if is_superadmin else profile.branch_name
+
     try:
-        return await document_ingestor.ingest_uploads(uploads)
+        return await document_ingestor.ingest_uploads(
+            uploads, branch_id=upload_branch_id, branch_name=upload_branch_name
+        )
     except NoValidDocumentsError as exc:
         raise HTTPException(
             status_code=422,
@@ -146,6 +156,8 @@ async def debug_user_permissions(
         "email": current_user.email,
         "role": profile.role,
         "normalized_role": profile.normalized_role,
+        "branch_id": profile.branch_id,
+        "branch_name": profile.branch_name,
         "has_full_access": profile.has_full_access,
         "direct_group_ids": list(profile.direct_group_ids),
         "accessible_group_ids": list(profile.accessible_group_ids),
@@ -208,20 +220,32 @@ async def list_documents(
     # Log user permissions for debugging
     logger.info(
         f"User {current_user.id} permissions - Role: {profile.role}, "
+        f"Branch: {profile.branch_name} ({profile.branch_id}), "
         f"Has full access: {profile.has_full_access}, "
         f"Folder paths: {list(profile.folder_paths)}"
     )
 
     is_admin = profile.normalized_role == "admin"
 
+    # Filter documents by branch first
+    # Superadmins see all branches, admins and users see only their branch
+    if is_superadmin:
+        branch_filtered_docs = raw_documents
+    else:
+        # Filter by user's branch
+        branch_filtered_docs = [
+            doc for doc in raw_documents
+            if doc.get("branch_id") == profile.branch_id
+        ]
+
     # For superadmin and admin, use group-based access snapshot
     # For regular users, bypass access snapshot and check document permissions instead
     if is_superadmin or is_admin:
-        access_snapshot = build_document_access_snapshot(raw_documents, profile)
+        access_snapshot = build_document_access_snapshot(branch_filtered_docs, profile)
         documents_to_check = access_snapshot.documents
     else:
         # Regular users: don't filter by groups, check all documents with document_permissions
-        documents_to_check = [dict(item) for item in raw_documents]
+        documents_to_check = [dict(item) for item in branch_filtered_docs]
 
     accessible_documents = []
 
@@ -250,6 +274,8 @@ async def list_documents(
                     relative_path=relative_path_value,
                     directory=str(record.get("directory") or ""),
                     chunks_indexed=int(record.get("chunks_indexed", 0)),
+                    branch_id=str(record.get("branch_id")) if record.get("branch_id") else None,
+                    branch_name=str(record.get("branch_name")) if record.get("branch_name") else None,
                 )
             )
         except Exception as exc:  # pragma: no cover - defensive logging

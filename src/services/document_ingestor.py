@@ -52,14 +52,21 @@ class DocumentIngestor:
         self.metadata_service = metadata_service
         self.logger = logger
 
-    async def ingest_uploads(self, uploads: Sequence[UploadFile]) -> DocumentIngestResponse:
+    async def ingest_uploads(
+        self,
+        uploads: Sequence[UploadFile],
+        branch_id: str | None = None,
+        branch_name: str | None = None,
+    ) -> DocumentIngestResponse:
         successes: List[DocumentUploadResult] = []
         failures: List[DocumentUploadError] = []
         total_chunks = 0
 
         for upload in uploads:
             try:
-                file_successes, file_failures, file_chunks = await self._ingest_upload(upload)
+                file_successes, file_failures, file_chunks = await self._ingest_upload(
+                    upload, branch_id=branch_id, branch_name=branch_name
+                )
                 successes.extend(file_successes)
                 failures.extend(file_failures)
                 total_chunks += file_chunks
@@ -82,7 +89,10 @@ class DocumentIngestor:
         )
 
     async def _ingest_upload(
-        self, upload: UploadFile
+        self,
+        upload: UploadFile,
+        branch_id: str | None = None,
+        branch_name: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         filename = upload.filename or ""
         if not filename:
@@ -94,16 +104,19 @@ class DocumentIngestor:
             )
 
         if filename.lower().endswith(".zip"):
-            return await self._process_archive_upload(upload)
+            return await self._process_archive_upload(upload, branch_id=branch_id, branch_name=branch_name)
 
-        result, error = await self._process_single_pdf(upload)
+        result, error = await self._process_single_pdf(upload, branch_id=branch_id, branch_name=branch_name)
         successes = [result] if result else []
         failures = [error] if error else []
         chunks = result.chunks_indexed if result else 0
         return successes, failures, chunks
 
     async def _process_single_pdf(
-        self, upload: UploadFile
+        self,
+        upload: UploadFile,
+        branch_id: str | None = None,
+        branch_name: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         try:
             stored = await self.storage_service.save_pdf(
@@ -122,6 +135,8 @@ class DocumentIngestor:
                 stored.local_path,
                 relative_path,
                 upload.filename or relative_path.name,
+                branch_id=branch_id,
+                branch_name=branch_name,
             )
             return result, error
         finally:
@@ -129,7 +144,10 @@ class DocumentIngestor:
                 self.storage_service.cleanup_local_path(stored.local_path)
 
     async def _process_archive_upload(
-        self, upload: UploadFile
+        self,
+        upload: UploadFile,
+        branch_id: str | None = None,
+        branch_name: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         try:
             archive_bytes = await upload.read()
@@ -179,6 +197,8 @@ class DocumentIngestor:
                             stored_document.local_path,
                             stored_document.relative_path,
                             member_name,
+                            branch_id=branch_id,
+                            branch_name=branch_name,
                         )
                         if result:
                             successes.append(result)
@@ -202,7 +222,12 @@ class DocumentIngestor:
         return successes, failures, chunks
 
     def _ingest_saved_pdf(
-        self, saved_path: Path, relative_path: Path, source_label: str
+        self,
+        saved_path: Path,
+        relative_path: Path,
+        source_label: str,
+        branch_id: str | None = None,
+        branch_name: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         document = self.pdf_processor.process_pdf(saved_path)
         if document is None:
@@ -228,7 +253,9 @@ class DocumentIngestor:
                 reason="No content was indexed from the PDF",
             )
 
-        self.metadata_service.record_document(relative_path, chunks_indexed)
+        self.metadata_service.record_document(
+            relative_path, chunks_indexed, branch_id=branch_id, branch_name=branch_name
+        )
 
         directory = relative_path.parent.as_posix() if relative_path.parent.as_posix() != "." else ""
         result = DocumentUploadResult(
@@ -237,6 +264,8 @@ class DocumentIngestor:
             directory=directory,
             chunks_indexed=chunks_indexed,
             message="PDF processed and indexed successfully",
+            branch_id=branch_id,
+            branch_name=branch_name,
         )
 
         return result, None

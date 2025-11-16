@@ -17,6 +17,8 @@ class UserAccessProfile:
     user_id: str
     role: str
     normalized_role: str
+    branch_id: Optional[str]
+    branch_name: Optional[str]
     direct_group_ids: FrozenSet[str]
     accessible_group_ids: FrozenSet[str]
     folder_paths: FrozenSet[str]
@@ -63,6 +65,29 @@ class SettingsManager:
             return "user"
         role = records[0].get("role")
         return str(role) if role else "user"
+
+    def get_user_branch(self, user_id: str, *, client: Optional[Client] = None) -> tuple[Optional[str], Optional[str]]:
+        """Get user's branch_id and branch_name. Returns (None, None) for superadmins."""
+        client = client or self._require_client()
+        try:
+            response = (
+                client.table("user_roles")
+                .select("branch_id, branch_name")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch user branch for %s: %s", user_id, exc)
+            return None, None
+
+        records = response.data or []
+        if not records:
+            return None, None
+
+        branch_id = records[0].get("branch_id")
+        branch_name = records[0].get("branch_name")
+        return (str(branch_id) if branch_id else None, str(branch_name) if branch_name else None)
 
     def list_groups(self) -> list[dict[str, Any]]:
         client = self._require_client()
@@ -190,6 +215,8 @@ class SettingsManager:
                 user_id=user_id,
                 role="superadmin",
                 normalized_role="superadmin",
+                branch_id=None,
+                branch_name=None,
                 direct_group_ids=frozenset(),
                 accessible_group_ids=frozenset(),
                 folder_paths=frozenset(),
@@ -200,6 +227,9 @@ class SettingsManager:
             role = self.get_user_role(user_id, client=client)
         except RuntimeError:
             role = "user"
+
+        # Get user's branch information
+        branch_id, branch_name = self.get_user_branch(user_id, client=client)
 
         # Normalize role to one of: superadmin, admin, user
         normalized_role = str(role or "user").strip().lower().replace("-", "_").replace(" ", "_")
@@ -220,6 +250,8 @@ class SettingsManager:
                 user_id=user_id,
                 role=str(role or "admin"),
                 normalized_role=normalized_role or "admin",
+                branch_id=None,  # Superadmins have no branch restriction
+                branch_name="All Branches",
                 direct_group_ids=frozenset(),
                 accessible_group_ids=frozenset(),
                 folder_paths=frozenset(),
@@ -288,6 +320,8 @@ class SettingsManager:
             user_id=user_id,
             role=str(role or "user"),
             normalized_role=normalized_role or "user",
+            branch_id=branch_id,
+            branch_name=branch_name,
             direct_group_ids=frozenset(direct_group_ids),
             accessible_group_ids=frozenset(accessible_group_ids),
             folder_paths=frozenset(folder_paths),
@@ -366,7 +400,7 @@ class SettingsManager:
         try:
             response = (
                 client.table("user_roles")
-                .select("id, user_id, role")
+                .select("id, user_id, role, branch_id, branch_name")
                 .execute()
             )
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -387,6 +421,8 @@ class SettingsManager:
                     "user_id": user_id,
                     "role": record.get("role"),
                     "email": email,
+                    "branch_id": record.get("branch_id"),
+                    "branch_name": record.get("branch_name"),
                 }
             )
         return users
@@ -397,7 +433,7 @@ class SettingsManager:
 
         try:
             # Build query with search filter
-            query = client.table("user_roles").select("id, user_id, role", count="exact")
+            query = client.table("user_roles").select("id, user_id, role, branch_id, branch_name", count="exact")
 
             # Get total count first (for all matching records)
             count_response = query.execute()
@@ -406,7 +442,7 @@ class SettingsManager:
             # Now get paginated results
             response = (
                 client.table("user_roles")
-                .select("id, user_id, role")
+                .select("id, user_id, role, branch_id, branch_name")
                 .range(offset, offset + limit - 1)
                 .execute()
             )
@@ -436,6 +472,8 @@ class SettingsManager:
                     "user_id": user_id,
                     "role": record.get("role"),
                     "email": email,
+                    "branch_id": record.get("branch_id"),
+                    "branch_name": record.get("branch_name"),
                 }
             )
 
@@ -569,7 +607,7 @@ class SettingsManager:
 
         return None
 
-    def assign_user_role(self, *, user_id: str, role: str, assigned_by: Optional[str]) -> None:
+    def assign_user_role(self, *, user_id: str, role: str, assigned_by: Optional[str], branch_id: Optional[str] = None, branch_name: Optional[str] = None) -> None:
         client = self._require_client()
         payload = {
             "user_id": user_id,
@@ -577,11 +615,62 @@ class SettingsManager:
         }
         if assigned_by:
             payload["assigned_by"] = assigned_by
+
+        # Superadmins should have null branch_id
+        if role == "superadmin":
+            payload["branch_id"] = None
+            payload["branch_name"] = "All Branches"
+        else:
+            if branch_id:
+                payload["branch_id"] = branch_id
+            if branch_name:
+                payload["branch_name"] = branch_name
+
         try:
             client.table("user_roles").upsert(payload, on_conflict="user_id").execute()
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.error("Failed to upsert role %s for %s: %s", role, user_id, exc)
             raise RuntimeError("Failed to assign user role") from exc
+
+    def list_branches(self) -> list[dict[str, Any]]:
+        """Get all branches."""
+        client = self._require_client()
+        try:
+            response = client.table("branches").select("id, name, created_at").order("name").execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to list branches: %s", exc)
+            raise RuntimeError("Failed to list branches") from exc
+        return response.data or []
+
+    def create_branch(self, *, name: str) -> str:
+        """Create a new branch and return its ID."""
+        client = self._require_client()
+
+        try:
+            response = client.table("branches").select("id").eq("name", name).limit(1).execute()
+            if response.data:
+                raise RuntimeError(f"Branch with name '{name}' already exists")
+        except RuntimeError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to check for existing branch: %s", exc)
+            raise RuntimeError("Failed to check for existing branch") from exc
+
+        payload = {"name": name}
+        try:
+            response = client.table("branches").insert(payload).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to create branch '%s': %s", name, exc)
+            raise RuntimeError("Failed to create branch") from exc
+
+        if not response.data or len(response.data) == 0:
+            raise RuntimeError("Failed to create branch - no data returned")
+
+        branch_id = response.data[0].get("id")
+        if not branch_id:
+            raise RuntimeError("Failed to create branch - no ID returned")
+
+        return str(branch_id)
 
     def add_user_to_groups(self, *, user_id: str, group_ids: Sequence[str], added_by: Optional[str]) -> None:
         client = self._require_client()
@@ -689,13 +778,21 @@ class SettingsManager:
         group_ids: Sequence[str],
         folder_paths: Sequence[str],
         acting_user_id: Optional[str],
+        branch_id: Optional[str] = None,
+        branch_name: Optional[str] = None,
     ) -> dict[str, Any]:
         user_id = self._find_user_id_by_email(email)
         if not user_id:
             raise RuntimeError("No Supabase profile found for the provided email")
 
         if role:
-            self.assign_user_role(user_id=user_id, role=role, assigned_by=acting_user_id)
+            self.assign_user_role(
+                user_id=user_id,
+                role=role,
+                assigned_by=acting_user_id,
+                branch_id=branch_id,
+                branch_name=branch_name,
+            )
         self.add_user_to_groups(user_id=user_id, group_ids=group_ids, added_by=acting_user_id)
         self.grant_group_folder_permissions(
             group_ids=group_ids,

@@ -13,6 +13,8 @@ class DocumentUploadResult(BaseModel):
     directory: str
     chunks_indexed: int
     message: str
+    branch_id: str | None = None
+    branch_name: str | None = None
 
 
 class DocumentUploadError(BaseModel):
@@ -25,6 +27,8 @@ class DocumentListItem(BaseModel):
     relative_path: str
     directory: str
     chunks_indexed: int
+    branch_id: str | None = None
+    branch_name: str | None = None
 
 
 class DocumentListResponse(BaseModel):
