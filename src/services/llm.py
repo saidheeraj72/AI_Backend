@@ -13,7 +13,7 @@ load_dotenv()
 
 LLM_MODELS: Dict[str, Dict[str, Any]] = {
     "daily": {
-        "model": "gemma2-9b-it",
+        "model": "openai/gpt-oss-20b",
         "name": "Daily Use LLM",
         "system_prompt": "You are a helpful assistant for everyday tasks. Provide clear, concise answers.",
         "supports_vision": False,

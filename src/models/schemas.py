@@ -104,3 +104,12 @@ class ChatSessionListResponse(BaseModel):
 class ChatHistoryScope(str, Enum):
     session = "session"
     sessions = "sessions"
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str = Field(..., description="Search query to match against filenames and paths")
+
+
+class DocumentSearchResponse(BaseModel):
+    documents: list[DocumentListItem] = Field(default_factory=list)
+    total_count: int = Field(description="Total number of matching documents")

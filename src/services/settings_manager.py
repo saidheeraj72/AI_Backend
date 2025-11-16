@@ -73,6 +73,41 @@ class SettingsManager:
             raise RuntimeError("Failed to list groups") from exc
         return response.data or []
 
+    def create_group(self, *, name: str, created_by: Optional[str]) -> str:
+        """Create a new group and return its ID."""
+        client = self._require_client()
+
+        # Check if group with this name already exists
+        try:
+            response = client.table("groups").select("id").eq("name", name).limit(1).execute()
+            if response.data:
+                raise RuntimeError(f"Group with name '{name}' already exists")
+        except RuntimeError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to check for existing group: %s", exc)
+            raise RuntimeError("Failed to check for existing group") from exc
+
+        # Create the group
+        payload = {"name": name}
+        if created_by:
+            payload["created_by"] = created_by
+
+        try:
+            response = client.table("groups").insert(payload).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to create group '%s': %s", name, exc)
+            raise RuntimeError("Failed to create group") from exc
+
+        if not response.data or len(response.data) == 0:
+            raise RuntimeError("Failed to create group - no data returned")
+
+        group_id = response.data[0].get("id")
+        if not group_id:
+            raise RuntimeError("Failed to create group - no ID returned")
+
+        return str(group_id)
+
     def _fetch_email_via_admin_api(self, user_id: str) -> Optional[str]:
         supabase_url = self._settings.supabase_url
         supabase_key = self._settings.supabase_key
@@ -166,8 +201,19 @@ class SettingsManager:
         except RuntimeError:
             role = "user"
 
+        # Normalize role to one of: superadmin, admin, user
         normalized_role = str(role or "user").strip().lower().replace("-", "_").replace(" ", "_")
-        has_full_access = normalized_role in {"admin", "superadmin"}
+
+        # Map various role names to the 3 standard roles
+        if normalized_role in {"superadmin", "super_admin"}:
+            normalized_role = "superadmin"
+        elif normalized_role in {"admin"}:
+            normalized_role = "admin"
+        else:
+            normalized_role = "user"
+
+        # Only superadmin has full access (can see everything)
+        has_full_access = normalized_role == "superadmin"
 
         if has_full_access:
             return UserAccessProfile(
@@ -345,6 +391,124 @@ class SettingsManager:
             )
         return users
 
+    def list_users_paginated(self, *, offset: int = 0, limit: int = 10, search: str = "") -> dict[str, Any]:
+        """Get paginated list of users with optional search"""
+        client = self._require_client()
+
+        try:
+            # Build query with search filter
+            query = client.table("user_roles").select("id, user_id, role", count="exact")
+
+            # Get total count first (for all matching records)
+            count_response = query.execute()
+            total_count = count_response.count or 0
+
+            # Now get paginated results
+            response = (
+                client.table("user_roles")
+                .select("id, user_id, role")
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to list user roles paginated: %s", exc)
+            raise RuntimeError("Failed to list users") from exc
+
+        records = response.data or []
+        user_ids = {str(record.get("user_id")) for record in records if record.get("user_id")}
+        email_lookup = self._fetch_emails_by_user_ids(client, user_ids)
+
+        users: list[dict[str, Any]] = []
+        for record in records:
+            user_id = record.get("user_id")
+            email = email_lookup.get(str(user_id)) or ""
+
+            # Apply search filter on email and role
+            if search:
+                search_lower = search.lower()
+                if search_lower not in email.lower() and search_lower not in str(record.get("role", "")).lower():
+                    total_count -= 1
+                    continue
+
+            users.append(
+                {
+                    "id": record.get("id"),
+                    "user_id": user_id,
+                    "role": record.get("role"),
+                    "email": email,
+                }
+            )
+
+        return {
+            "users": users,
+            "total": total_count,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def list_groups_paginated(self, *, offset: int = 0, limit: int = 10, search: str = "") -> dict[str, Any]:
+        """Get paginated list of groups with optional search"""
+        client = self._require_client()
+
+        try:
+            # Build query with search filter
+            query = client.table("groups").select("*", count="exact")
+
+            if search:
+                query = query.ilike("name", f"%{search}%")
+
+            # Get total count
+            count_response = query.execute()
+            total_count = count_response.count or 0
+
+            # Get paginated results
+            query = client.table("groups").select("*")
+            if search:
+                query = query.ilike("name", f"%{search}%")
+
+            response = query.range(offset, offset + limit - 1).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to list groups paginated: %s", exc)
+            raise RuntimeError("Failed to list groups") from exc
+
+        groups = response.data or []
+
+        # Get folder permissions for these groups
+        group_ids = [g.get("id") for g in groups if g.get("id")]
+        folders_by_group: dict[str, list[str]] = {}
+
+        if group_ids:
+            try:
+                folder_perms_response = (
+                    client.table("group_folder_permissions")
+                    .select("group_id, folder_path")
+                    .in_("group_id", group_ids)
+                    .execute()
+                )
+
+                for entry in (folder_perms_response.data or []):
+                    group_id = entry.get("group_id")
+                    folder_path = entry.get("folder_path")
+                    if group_id and folder_path:
+                        folders_by_group.setdefault(group_id, [])
+                        if folder_path not in folders_by_group[group_id]:
+                            folders_by_group[group_id].append(folder_path)
+            except Exception as exc:  # pragma: no cover
+                self.logger.error("Failed to fetch folder permissions: %s", exc)
+
+        # Add folder_paths to each group
+        for group in groups:
+            group_id = group.get("id")
+            if group_id and group_id in folders_by_group:
+                group["folder_paths"] = sorted(folders_by_group[group_id])
+
+        return {
+            "groups": groups,
+            "total": total_count,
+            "offset": offset,
+            "limit": limit,
+        }
+
     def _find_user_id_by_email(self, email: str) -> Optional[str]:
         client = self._require_client()
         normalized_email = email.lower()
@@ -420,11 +584,35 @@ class SettingsManager:
             raise RuntimeError("Failed to assign user role") from exc
 
     def add_user_to_groups(self, *, user_id: str, group_ids: Sequence[str], added_by: Optional[str]) -> None:
-        if not group_ids:
-            return
         client = self._require_client()
+
+        # If no groups specified, remove user from all groups
+        if not group_ids:
+            try:
+                client.table("group_members").delete().eq("user_id", user_id).execute()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to remove existing group memberships for %s: %s", user_id, exc)
+                raise RuntimeError("Failed to clear existing group memberships") from exc
+            return
+
+        # Get existing group memberships for this user
+        try:
+            response = client.table("group_members").select("group_id").eq("user_id", user_id).execute()
+            existing_group_ids = {record.get("group_id") for record in (response.data or [])}
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch existing group memberships for %s: %s", user_id, exc)
+            raise RuntimeError("Failed to fetch existing group memberships") from exc
+
+        # Filter out groups the user is already a member of
+        new_group_ids = [gid for gid in group_ids if gid not in existing_group_ids]
+
+        if not new_group_ids:
+            # User is already a member of all specified groups
+            return
+
+        # Add user to the new groups
         payload = []
-        for group_id in group_ids:
+        for group_id in new_group_ids:
             entry = {
                 "group_id": group_id,
                 "user_id": user_id,
@@ -434,10 +622,22 @@ class SettingsManager:
             payload.append(entry)
 
         try:
-            client.table("group_members").upsert(payload, on_conflict="group_id,user_id").execute()
+            client.table("group_members").insert(payload).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to upsert group memberships for %s: %s", user_id, exc)
+            self.logger.error("Failed to add group memberships for %s: %s", user_id, exc)
             raise RuntimeError("Failed to add user to groups") from exc
+
+    def remove_user_from_group(self, *, user_id: str, group_id: str) -> None:
+        """Remove a user from a specific group."""
+        client = self._require_client()
+
+        try:
+            response = client.table("group_members").delete().eq("user_id", user_id).eq("group_id", group_id).execute()
+            if not response.data or len(response.data) == 0:
+                self.logger.warning("No group membership found for user %s in group %s", user_id, group_id)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to remove user %s from group %s: %s", user_id, group_id, exc)
+            raise RuntimeError("Failed to remove user from group") from exc
 
     def grant_group_folder_permissions(
         self,
@@ -446,10 +646,24 @@ class SettingsManager:
         folder_paths: Sequence[str],
         granted_by: Optional[str],
     ) -> None:
-        if not group_ids or not folder_paths:
+        if not group_ids:
             return
 
         client = self._require_client()
+
+        # First, delete all existing folder permissions for these groups
+        try:
+            for group_id in group_ids:
+                client.table("group_folder_permissions").delete().eq("group_id", group_id).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to delete existing folder permissions: %s", exc)
+            raise RuntimeError("Failed to clear existing folder permissions") from exc
+
+        # If no folder_paths provided, we're done (user has no folder restrictions)
+        if not folder_paths:
+            return
+
+        # Now insert the new folder permissions
         payload = []
         for group_id in group_ids:
             for folder_path in folder_paths:
@@ -462,12 +676,9 @@ class SettingsManager:
                 payload.append(entry)
 
         try:
-            client.table("group_folder_permissions").upsert(
-                payload,
-                on_conflict="group_id,folder_path",
-            ).execute()
+            client.table("group_folder_permissions").insert(payload).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to upsert folder permissions: %s", exc)
+            self.logger.error("Failed to insert folder permissions: %s", exc)
             raise RuntimeError("Failed to grant folder permissions") from exc
 
     def create_user_assignments(
@@ -559,6 +770,13 @@ class SettingsManager:
     def delete_user(self, *, target_user_id: str, acting_user_id: Optional[str]) -> None:
         if acting_user_id and target_user_id == acting_user_id:
             raise RuntimeError("You cannot remove your own account")
+
+        # Check if acting user is superadmin - only superadmins can delete users
+        if acting_user_id:
+            acting_user_role = self.get_user_role(acting_user_id)
+            normalized_acting_role = str(acting_user_role).strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized_acting_role not in {"superadmin", "super_admin"}:
+                raise RuntimeError("Only superadmins can delete users")
 
         client = self._require_client()
         try:
