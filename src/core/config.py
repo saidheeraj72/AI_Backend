@@ -43,6 +43,7 @@ class Settings:
         self.supabase_documents_table = os.getenv(
             "SUPABASE_DOCUMENTS_TABLE", "documents_metadata"
         )
+        self.default_org_id = os.getenv("DEFAULT_ORGANIZATION_ID", "").strip()
         self.supabase_configured = bool(
             self.supabase_url and self.supabase_key and self.supabase_storage_bucket
         )

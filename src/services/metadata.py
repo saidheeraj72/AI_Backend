@@ -19,11 +19,13 @@ class MetadataService:
         supabase_url: str = "",
         supabase_key: str = "",
         supabase_table: str = "",
+        default_org_id: str | None = None,
     ) -> None:
         self.metadata_path = metadata_path
         self.logger = logger or logging.getLogger(__name__)
         self._supabase_client: Optional[Client] = None
         self._supabase_table = supabase_table
+        self._default_org_id = (default_org_id or "").strip() or None
 
         if supabase_url and supabase_key and supabase_table:
             try:
@@ -60,33 +62,48 @@ class MetadataService:
             return
         self.metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _require_supabase_org_id(self, override: Optional[str] = None) -> str:
+        org_id = override or self._default_org_id
+        if not org_id:
+            raise RuntimeError("DEFAULT_ORGANIZATION_ID must be configured when Supabase metadata is enabled")
+        return org_id
+
     def record_document(
         self,
         relative_path: Path,
         chunks_indexed: int,
         branch_id: Optional[str] = None,
         branch_name: Optional[str] = None,
+        *,
+        org_id: Optional[str] = None,
+        created_by: Optional[str] = None,
     ) -> None:
         if self._supabase_enabled:
             relative_key = relative_path.as_posix()
             directory_key = relative_path.parent.as_posix()
+            resolved_org_id = self._require_supabase_org_id(org_id)
             payload = {
-                "relative_path": relative_key,
-                "filename": relative_path.name,
-                "directory": directory_key if directory_key != "." else "",
-                "chunks_indexed": chunks_indexed,
+                "org_id": resolved_org_id,
+                "title": relative_path.name,
+                "storage_path": relative_key,
+                "folder_path": directory_key if directory_key != "." else "",
+                "metadata": {
+                    "chunks_indexed": chunks_indexed,
+                    "branch_name": branch_name,
+                },
             }
 
             # Add branch information if provided
             if branch_id is not None:
                 payload["branch_id"] = branch_id
-            if branch_name is not None:
-                payload["branch_name"] = branch_name
+            if created_by is not None:
+                payload["created_by"] = created_by
 
             try:
                 assert self._supabase_client is not None
                 self._supabase_client.table(self._supabase_table).upsert(
-                    payload, on_conflict="relative_path"
+                    payload,
+                    on_conflict="org_id,storage_path",
                 ).execute()
                 self.logger.info("Recorded metadata for %s in Supabase", relative_key)
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -132,14 +149,16 @@ class MetadataService:
         self._save(data)
         self.logger.info("Recorded metadata for %s", relative_path)
 
-    def list_documents(self) -> List[Dict[str, Any]]:
+    def list_documents(self, *, org_id: Optional[str] = None) -> List[Dict[str, Any]]:
         if self._supabase_enabled:
             try:
                 assert self._supabase_client is not None
+                resolved_org = self._require_supabase_org_id(org_id)
                 response = (
                     self._supabase_client.table(self._supabase_table)
-                    .select("relative_path, filename, directory, chunks_indexed, branch_id, branch_name")
-                    .order("relative_path")
+                    .select("id, title, storage_path, folder_path, branch_id, metadata")
+                    .eq("org_id", resolved_org)
+                    .order("storage_path")
                     .execute()
                 )
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -149,21 +168,20 @@ class MetadataService:
             records = response.data or []
             items: List[Dict[str, Any]] = []
             for record in records:
-                relative_path = record.get("relative_path")
-                if not relative_path:
+                storage_path = record.get("storage_path")
+                if not storage_path:
                     continue
-                filename = record.get("filename") or Path(relative_path).name
-                directory = record.get("directory") or ""
-                chunks_indexed = int(record.get("chunks_indexed") or 0)
-                branch_id = record.get("branch_id")
-                branch_name = record.get("branch_name")
+                metadata = record.get("metadata") or {}
+                chunks_indexed = metadata.get("chunks_indexed") if isinstance(metadata, dict) else None
+                branch_name = metadata.get("branch_name") if isinstance(metadata, dict) else None
                 items.append(
                     {
-                        "filename": filename,
-                        "relative_path": relative_path,
-                        "directory": directory,
-                        "chunks_indexed": chunks_indexed,
-                        "branch_id": branch_id,
+                        "id": record.get("id"),
+                        "filename": record.get("title") or Path(storage_path).name,
+                        "relative_path": storage_path,
+                        "directory": record.get("folder_path") or "",
+                        "chunks_indexed": int(chunks_indexed or 0),
+                        "branch_id": record.get("branch_id"),
                         "branch_name": branch_name,
                     }
                 )
@@ -179,6 +197,7 @@ class MetadataService:
             directory = info.get("directory", "")
             items.append(
                 {
+                    "id": relative_path,
                     "filename": info.get("filename", Path(relative_path).name),
                     "relative_path": relative_path,
                     "directory": directory,
@@ -189,20 +208,22 @@ class MetadataService:
         items.sort(key=lambda entry: entry["relative_path"].lower())
         return items
 
-    def get_directory_tree(self) -> Dict[str, Any]:
+    def get_directory_tree(self, *, org_id: Optional[str] = None) -> Dict[str, Any]:
         if self._supabase_enabled:
-            return self._build_directory_tree_from_records(self.list_documents())
+            return self._build_directory_tree_from_records(self.list_documents(org_id=org_id))
         data = self._load()
         return data.get("directories", {})
 
-    def get_document(self, relative_path: str) -> Optional[Dict[str, Any]]:
+    def get_document(self, relative_path: str, *, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if self._supabase_enabled:
             try:
                 assert self._supabase_client is not None
+                resolved_org = self._require_supabase_org_id(org_id)
                 response = (
                     self._supabase_client.table(self._supabase_table)
-                    .select("relative_path, filename, directory, chunks_indexed, branch_id, branch_name")
-                    .eq("relative_path", relative_path)
+                    .select("id, title, storage_path, folder_path, branch_id, metadata")
+                    .eq("org_id", resolved_org)
+                    .eq("storage_path", relative_path)
                     .limit(1)
                     .execute()
                 )
@@ -215,13 +236,15 @@ class MetadataService:
                 return None
 
             record = records[0]
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
             return {
-                "relative_path": record.get("relative_path", relative_path),
-                "filename": record.get("filename", Path(relative_path).name),
-                "directory": record.get("directory", ""),
-                "chunks_indexed": int(record.get("chunks_indexed") or 0),
+                "id": record.get("id"),
+                "relative_path": record.get("storage_path", relative_path),
+                "filename": record.get("title", Path(relative_path).name),
+                "directory": record.get("folder_path", ""),
+                "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
                 "branch_id": record.get("branch_id"),
-                "branch_name": record.get("branch_name"),
+                "branch_name": (metadata or {}).get("branch_name"),
             }
 
         data = self._load()
@@ -230,18 +253,57 @@ class MetadataService:
             return None
 
         return {
+            "id": relative_path,
             "relative_path": relative_path,
             **document,
         }
 
-    def delete_document(self, relative_path: str) -> bool:
+    def get_document_by_id(self, document_id: str, *, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if self._supabase_enabled:
             try:
                 assert self._supabase_client is not None
+                resolved_org = self._require_supabase_org_id(org_id)
+                response = (
+                    self._supabase_client.table(self._supabase_table)
+                    .select("id, title, storage_path, folder_path, branch_id, metadata")
+                    .eq("org_id", resolved_org)
+                    .eq("id", document_id)
+                    .limit(1)
+                    .execute()
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to fetch metadata for document %s: %s", document_id, exc)
+                return None
+
+            records = response.data or []
+            if not records:
+                return None
+
+            record = records[0]
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            return {
+                "id": record.get("id"),
+                "relative_path": record.get("storage_path"),
+                "filename": record.get("title"),
+                "directory": record.get("folder_path", ""),
+                "branch_id": record.get("branch_id"),
+                "branch_name": metadata.get("branch_name") if isinstance(metadata, dict) else None,
+                "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
+            }
+
+        # File-based metadata: treat the identifier as the relative path key
+        return self.get_document(document_id, org_id=org_id)
+
+    def delete_document(self, relative_path: str, *, org_id: Optional[str] = None) -> bool:
+        if self._supabase_enabled:
+            try:
+                assert self._supabase_client is not None
+                resolved_org = self._require_supabase_org_id(org_id)
                 response = (
                     self._supabase_client.table(self._supabase_table)
                     .delete()
-                    .eq("relative_path", relative_path)
+                    .eq("org_id", resolved_org)
+                    .eq("storage_path", relative_path)
                     .execute()
                 )
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -286,7 +348,7 @@ class MetadataService:
         directories: Dict[str, Dict[str, List[str]]] = {".": {"files": [], "subdirectories": []}}
 
         for record in records:
-            relative_path = record.get("relative_path")
+            relative_path = record.get("relative_path") or record.get("storage_path")
             if not relative_path:
                 continue
 

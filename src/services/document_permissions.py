@@ -2,26 +2,41 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Sequence
 
 from supabase import Client, create_client
 
 from src.core.config import Settings
 
 
+ACCESS_RANK = {
+    "view": 0,
+    "comment": 1,
+    "edit": 2,
+    "admin": 3,
+}
+
+
 @dataclass
 class DocumentPermission:
-    """Document-level permission for a specific user."""
+    document_id: str
+    access_level: str
 
-    user_id: str
-    document_path: str
-    can_upload: bool
-    can_view: bool
-    can_delete: bool
+    @property
+    def can_view(self) -> bool:
+        return ACCESS_RANK.get(self.access_level, 0) >= ACCESS_RANK["view"]
+
+    @property
+    def can_upload(self) -> bool:
+        return ACCESS_RANK.get(self.access_level, 0) >= ACCESS_RANK["edit"]
+
+    @property
+    def can_delete(self) -> bool:
+        return ACCESS_RANK.get(self.access_level, 0) >= ACCESS_RANK["admin"]
 
 
 class DocumentPermissionsService:
-    """Service for managing per-document permissions."""
+    """Service for managing the document_permissions table."""
 
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or logging.getLogger(__name__)
@@ -41,225 +56,124 @@ class DocumentPermissionsService:
             raise RuntimeError("Supabase client is not configured")
         return self._client
 
-    def get_user_document_permission(
-        self,
-        user_id: str,
-        document_path: str,
-    ) -> Optional[DocumentPermission]:
-        """Get permission for a specific user and document."""
-        try:
-            client = self._require_client()
-        except RuntimeError:
-            # If Supabase is not configured, grant full access (for local development)
-            return DocumentPermission(
-                user_id=user_id,
-                document_path=document_path,
-                can_upload=True,
-                can_view=True,
-                can_delete=True,
-            )
+    def _fetch_permissions(self, *, user_id: str | None = None, group_ids: Sequence[str] | None = None, role_ids: Sequence[str] | None = None) -> list[dict[str, object]]:
+        client = self._require_client()
+        conditions = []
+        if user_id:
+            conditions.append(f"user_id.eq.{user_id}")
+        if group_ids:
+            groups_clause = ",".join(group_ids)
+            conditions.append(f"group_id.in.({groups_clause})")
+        if role_ids:
+            roles_clause = ",".join(role_ids)
+            conditions.append(f"role_id.in.({roles_clause})")
+
+        if not conditions:
+            return []
+
+        filter_string = "or(" + ",".join(conditions) + ")"
 
         try:
             response = (
                 client.table("document_permissions")
-                .select("can_upload, can_view, can_delete")
-                .eq("user_id", user_id)
-                .eq("document_path", document_path)
-                .limit(1)
+                .select("document_id, user_id, group_id, role_id, branch_id, access_level")
+                .or_(filter_string)
                 .execute()
             )
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error(
-                "Failed to fetch document permission for user %s, document %s: %s",
-                user_id,
-                document_path,
-                exc,
-            )
-            return None
+            self.logger.error("Failed to fetch document permissions: %s", exc)
+            return []
 
-        records = response.data or []
-        if not records:
-            return None
+        return response.data or []
 
-        record = records[0]
-        return DocumentPermission(
-            user_id=user_id,
-            document_path=document_path,
-            can_upload=bool(record.get("can_upload", False)),
-            can_view=bool(record.get("can_view", False)),
-            can_delete=bool(record.get("can_delete", False)),
-        )
+    def get_permissions_for_user_context(
+        self,
+        *,
+        user_id: str,
+        group_ids: Sequence[str],
+        role_ids: Sequence[str],
+    ) -> Dict[str, DocumentPermission]:
+        records = self._fetch_permissions(user_id=user_id, group_ids=group_ids, role_ids=role_ids)
+        aggregated: Dict[str, DocumentPermission] = {}
+        for record in records:
+            document_id = record.get("document_id")
+            access_level = str(record.get("access_level") or "view")
+            if not document_id:
+                continue
+            existing = aggregated.get(document_id)
+            if existing is None or ACCESS_RANK.get(access_level, 0) > ACCESS_RANK.get(existing.access_level, 0):
+                aggregated[document_id] = DocumentPermission(document_id=document_id, access_level=access_level)
+        return aggregated
 
     def get_all_user_document_permissions(self, user_id: str) -> list[DocumentPermission]:
-        """Get all document permissions for a specific user."""
-        try:
-            client = self._require_client()
-        except RuntimeError:
-            return []
+        records = self._fetch_permissions(user_id=user_id)
+        return [
+            DocumentPermission(document_id=str(record.get("document_id")), access_level=str(record.get("access_level") or "view"))
+            for record in records
+            if record.get("document_id")
+        ]
 
+    def revoke_all_for_user(self, user_id: str) -> None:
+        client = self._require_client()
         try:
-            response = (
-                client.table("document_permissions")
-                .select("document_path, can_upload, can_view, can_delete")
-                .eq("user_id", user_id)
-                .execute()
-            )
+            client.table("document_permissions").delete().eq("user_id", user_id).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch document permissions for user %s: %s", user_id, exc)
-            return []
-
-        permissions = []
-        for record in response.data or []:
-            permissions.append(
-                DocumentPermission(
-                    user_id=user_id,
-                    document_path=str(record.get("document_path", "")),
-                    can_upload=bool(record.get("can_upload", False)),
-                    can_view=bool(record.get("can_view", False)),
-                    can_delete=bool(record.get("can_delete", False)),
-                )
-            )
-        return permissions
-
-    def user_can_view_document(self, user_id: str, document_path: str, is_superadmin: bool = False) -> bool:
-        """Check if user has view permission for a specific document."""
-        if is_superadmin:
-            return True
-
-        # Get all folder permissions for this user
-        permissions = self.get_all_user_document_permissions(user_id)
-
-        self.logger.info(f"[user_can_view_document] Checking document: {document_path}")
-        self.logger.info(f"[user_can_view_document] User {user_id} has {len(permissions)} permissions")
-        for perm in permissions:
-            self.logger.info(f"  - Path: {perm.document_path}, can_view: {perm.can_view}")
-
-        # Extract the folder path from the document path
-        if "/" in document_path:
-            folder_path = document_path.rsplit("/", 1)[0]
-        else:
-            folder_path = ""
-
-        self.logger.info(f"[user_can_view_document] Extracted folder: '{folder_path}'")
-
-        # Check if any permission matches the folder or parent folders
-        for perm in permissions:
-            if perm.can_view:
-                self.logger.info(f"[user_can_view_document] Checking permission path '{perm.document_path}' against folder '{folder_path}'")
-
-                # Check if document is in this folder or subfolder
-                if folder_path == perm.document_path or folder_path.startswith(perm.document_path + "/"):
-                    self.logger.info(f"[user_can_view_document] ✓ MATCH - Folder match!")
-                    return True
-                # Also check exact document path match
-                if document_path == perm.document_path:
-                    self.logger.info(f"[user_can_view_document] ✓ MATCH - Exact document match!")
-                    return True
-
-        self.logger.info(f"[user_can_view_document] ✗ NO MATCH - Access denied")
-        return False
-
-    def user_can_upload_document(self, user_id: str, document_path: str, is_superadmin: bool = False) -> bool:
-        """Check if user has upload permission for a specific document."""
-        if is_superadmin:
-            return True
-
-        # Get all folder permissions for this user
-        permissions = self.get_all_user_document_permissions(user_id)
-
-        # Extract the folder path from the document path
-        if "/" in document_path:
-            folder_path = document_path.rsplit("/", 1)[0]
-        else:
-            folder_path = ""
-
-        # Check if any permission matches the folder or parent folders
-        for perm in permissions:
-            if perm.can_upload:
-                # Check if document is in this folder or subfolder
-                if folder_path == perm.document_path or folder_path.startswith(perm.document_path + "/"):
-                    return True
-                # Also check exact document path match
-                if document_path == perm.document_path:
-                    return True
-
-        return False
-
-    def user_can_delete_document(self, user_id: str, document_path: str, is_superadmin: bool = False) -> bool:
-        """Check if user has delete permission for a specific document."""
-        if is_superadmin:
-            return True
-
-        # Get all folder permissions for this user
-        permissions = self.get_all_user_document_permissions(user_id)
-
-        # Extract the folder path from the document path
-        if "/" in document_path:
-            folder_path = document_path.rsplit("/", 1)[0]
-        else:
-            folder_path = ""
-
-        # Check if any permission matches the folder or parent folders
-        for perm in permissions:
-            if perm.can_delete:
-                # Check if document is in this folder or subfolder
-                if folder_path == perm.document_path or folder_path.startswith(perm.document_path + "/"):
-                    return True
-                # Also check exact document path match
-                if document_path == perm.document_path:
-                    return True
-
-        return False
+            raise RuntimeError("Failed to clear document permissions for user") from exc
 
     def grant_document_permission(
         self,
-        user_id: str,
-        document_path: str,
-        can_upload: bool = False,
-        can_view: bool = False,
-        can_delete: bool = False,
-        granted_by: Optional[str] = None,
+        *,
+        document_id: str,
+        access_level: str,
+        user_id: str | None = None,
+        group_id: str | None = None,
+        role_id: str | None = None,
+        branch_id: str | None = None,
     ) -> None:
-        """Grant or update document permission for a user."""
         client = self._require_client()
+        targets = [value for value in [user_id, group_id, role_id, branch_id] if value]
+        if not targets:
+            raise RuntimeError("At least one permission target must be provided")
 
         payload = {
-            "user_id": user_id,
-            "document_path": document_path,
-            "can_upload": can_upload,
-            "can_view": can_view,
-            "can_delete": can_delete,
+            "document_id": document_id,
+            "access_level": access_level,
         }
-        if granted_by:
-            payload["granted_by"] = granted_by
+        if user_id:
+            payload["user_id"] = user_id
+        if group_id:
+            payload["group_id"] = group_id
+        if role_id:
+            payload["role_id"] = role_id
+        if branch_id:
+            payload["branch_id"] = branch_id
 
         try:
-            client.table("document_permissions").upsert(
-                payload,
-                on_conflict="user_id,document_path",
-            ).execute()
+            client.table("document_permissions").insert(payload).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error(
-                "Failed to grant document permission for user %s, document %s: %s",
-                user_id,
-                document_path,
-                exc,
-            )
             raise RuntimeError("Failed to grant document permission") from exc
 
-    def revoke_document_permission(self, user_id: str, document_path: str) -> None:
-        """Revoke document permission for a user."""
+    def revoke_document_permission(
+        self,
+        *,
+        document_id: str,
+        user_id: str | None = None,
+        group_id: str | None = None,
+        role_id: str | None = None,
+        branch_id: str | None = None,
+    ) -> None:
         client = self._require_client()
+        query = client.table("document_permissions").delete().eq("document_id", document_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        if group_id:
+            query = query.eq("group_id", group_id)
+        if role_id:
+            query = query.eq("role_id", role_id)
+        if branch_id:
+            query = query.eq("branch_id", branch_id)
 
         try:
-            client.table("document_permissions").delete().eq("user_id", user_id).eq(
-                "document_path", document_path
-            ).execute()
+            query.execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error(
-                "Failed to revoke document permission for user %s, document %s: %s",
-                user_id,
-                document_path,
-                exc,
-            )
             raise RuntimeError("Failed to revoke document permission") from exc

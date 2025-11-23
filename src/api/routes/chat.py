@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Any, Optional, Sequence, Union
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -21,10 +21,12 @@ from src.services.chat_history import ChatHistoryService
 from src.services.llm import LLMService
 from src.services.metadata import MetadataService
 from src.services.rag import RAGChatService
-from src.services.document_access import build_document_access_snapshot, validate_requested_paths
+from src.services.document_permissions import ACCESS_RANK, DocumentPermission, DocumentPermissionsService
 from src.services.vectorstore import VectorStoreService
 from src.services.websearch import WebSearchService
 from src.services.settings_manager import SettingsManager
+from src.services.folder_permissions import FolderPermissionsService, expand_folder_permissions_to_documents
+from src.utils.paths import normalize_relative_path
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 rag_router = APIRouter(prefix="/rag", tags=["rag"])
@@ -38,6 +40,7 @@ metadata_service = MetadataService(
     supabase_url=settings.supabase_url,
     supabase_key=settings.supabase_key,
     supabase_table=settings.supabase_documents_table,
+    default_org_id=settings.default_org_id,
 )
 vector_service = VectorStoreService(settings, logger=logger)
 rag_service = RAGChatService(
@@ -50,6 +53,8 @@ rag_service = RAGChatService(
 chat_history_service = ChatHistoryService(settings, logger=logger)
 websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 settings_manager = SettingsManager(settings=settings, logger=logger)
+doc_permissions_service = DocumentPermissionsService(settings=settings, logger=logger)
+folder_permissions_service = FolderPermissionsService(settings=settings, logger=logger)
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -57,6 +62,67 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 def _ensure_user_access(current_user: SupabaseUser, requested_user_id: str) -> None:
     if current_user.id != requested_user_id:
         raise HTTPException(status_code=403, detail="Authenticated user mismatch")
+
+
+def _user_doc_acl(
+    profile,
+    user_id: str,
+    *,
+    documents: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, DocumentPermission]:
+    role_ids = [assignment.role.id for assignment in getattr(profile, "assignments", []) if getattr(assignment, "role", None)]
+    doc_map = doc_permissions_service.get_permissions_for_user_context(
+        user_id=user_id,
+        group_ids=list(profile.direct_group_ids),
+        role_ids=role_ids,
+    )
+
+    folder_entries = folder_permissions_service.get_permissions_for_user_context(
+        user_id=user_id,
+        group_ids=list(profile.direct_group_ids),
+        role_ids=role_ids,
+        org_id=profile.org_id,
+    )
+
+    if folder_entries:
+        documents_for_folder_acl = documents if documents is not None else metadata_service.list_documents(org_id=profile.org_id)
+        folder_doc_map = expand_folder_permissions_to_documents(folder_entries.values(), documents_for_folder_acl)
+        for document_id, permission in folder_doc_map.items():
+            existing = doc_map.get(document_id)
+            if existing is None or ACCESS_RANK.get(permission.access_level, 0) > ACCESS_RANK.get(existing.access_level, 0):
+                doc_map[document_id] = permission
+
+    return doc_map
+
+
+def _collect_accessible_documents(profile, user_id: str) -> list[dict[str, Any]]:
+    documents = metadata_service.list_documents(org_id=profile.org_id)
+    doc_acl = _user_doc_acl(profile, user_id, documents=documents)
+    accessible: list[dict[str, Any]] = []
+    is_org_owner = profile.normalized_role == "OrgOwner"
+    is_branch_manager = profile.normalized_role == "BranchManager"
+
+    for record in documents:
+        doc_id = str(record.get("id") or record.get("relative_path") or "")
+        if not doc_id:
+            continue
+        branch_id = record.get("branch_id")
+
+        if profile.normalized_role == "superadmin" or is_org_owner:
+            accessible.append(record)
+            continue
+        if is_branch_manager and branch_id and branch_id in profile.branch_ids:
+            # BranchManager gets automatic access to all documents in their branch
+            accessible.append(record)
+            continue
+        if doc_id in doc_acl and doc_acl[doc_id].can_view:
+            accessible.append(record)
+            continue
+    return accessible
+
+
+def _user_has_permission(profile, code: str) -> bool:
+    return bool(profile.has_full_access or (hasattr(profile, "permission_codes") and code in profile.permission_codes))
 
 
 @router.post("", response_model=ChatResponse)
@@ -87,6 +153,10 @@ async def chat(
         raise HTTPException(status_code=400, detail="websearch requires a text prompt")
 
     _ensure_user_access(current_user, user_id)
+
+    # Get user's org_id for chat history
+    profile = settings_manager.get_user_access_profile(user_id)
+    user_org_id = profile.org_id or settings.default_org_id
 
     augmented_prompt = prompt
     if websearch and prompt:
@@ -135,6 +205,7 @@ async def chat(
         has_image=image_bytes is not None,
         image_mime_type=image_mime,
         interaction_type="standard",
+        org_id=user_org_id,
     )
 
     result["chat_id"] = session_id
@@ -229,16 +300,15 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
     session_id = request.chat_session_id or str(uuid4())
 
     profile = settings_manager.get_user_access_profile(request.user_id)
-    raw_documents = metadata_service.list_documents()
-    access_snapshot = build_document_access_snapshot(raw_documents, profile)
+    accessible_documents = _collect_accessible_documents(profile, request.user_id)
 
-    if not access_snapshot.documents:
+    if not accessible_documents:
         raise HTTPException(status_code=403, detail="You do not have access to any documents.")
 
     if request.use_all:
         all_paths = [
             str(record.get("relative_path"))
-            for record in access_snapshot.documents
+            for record in accessible_documents
             if record.get("relative_path")
         ]
         if not all_paths:
@@ -249,13 +319,20 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
         if not requested_paths:
             raise HTTPException(status_code=400, detail="Select at least one document or enable use_all")
 
-        allowed_paths, denied_paths = validate_requested_paths(requested_paths, access_snapshot)
+        normalized_allowed = {normalize_relative_path(doc.get("relative_path") or ""): doc for doc in accessible_documents}
+        allowed_paths: list[str] = []
+        denied_paths: list[str] = []
+        for entry in requested_paths:
+            normalized = normalize_relative_path(entry)
+            if normalized in normalized_allowed:
+                allowed_paths.append(normalized)
+            else:
+                denied_paths.append(entry)
+
         if denied_paths:
             raise HTTPException(
                 status_code=403,
-                detail=
-                "You do not have permission to use the selected documents: "
-                + ", ".join(sorted(set(denied_paths))[:5]),
+                detail="You do not have permission to use the selected documents: " + ", ".join(sorted(set(denied_paths))[:5]),
             )
 
         if not allowed_paths:
@@ -270,13 +347,16 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
             question=request.question,
             document_paths=selected_documents,
             top_k=request.top_k,
-            document_records=access_snapshot.documents,
+            document_records=accessible_documents,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception("RAG chat failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to generate response") from exc
+
+    # Get user's org_id for chat history
+    user_org_id = profile.org_id or settings.default_org_id
 
     await run_in_threadpool(
         chat_history_service.save_chat,
@@ -296,6 +376,7 @@ async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
             "top_k": request.top_k,
             "sources": result.get("sources", []),
         },
+        org_id=user_org_id,
     )
 
     result["chat_id"] = session_id

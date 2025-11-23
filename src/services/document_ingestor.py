@@ -57,6 +57,9 @@ class DocumentIngestor:
         uploads: Sequence[UploadFile],
         branch_id: str | None = None,
         branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
     ) -> DocumentIngestResponse:
         successes: List[DocumentUploadResult] = []
         failures: List[DocumentUploadError] = []
@@ -65,7 +68,11 @@ class DocumentIngestor:
         for upload in uploads:
             try:
                 file_successes, file_failures, file_chunks = await self._ingest_upload(
-                    upload, branch_id=branch_id, branch_name=branch_name
+                    upload,
+                    branch_id=branch_id,
+                    branch_name=branch_name,
+                    org_id=org_id,
+                    created_by=created_by,
                 )
                 successes.extend(file_successes)
                 failures.extend(file_failures)
@@ -93,6 +100,9 @@ class DocumentIngestor:
         upload: UploadFile,
         branch_id: str | None = None,
         branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         filename = upload.filename or ""
         if not filename:
@@ -104,9 +114,21 @@ class DocumentIngestor:
             )
 
         if filename.lower().endswith(".zip"):
-            return await self._process_archive_upload(upload, branch_id=branch_id, branch_name=branch_name)
+            return await self._process_archive_upload(
+                upload,
+                branch_id=branch_id,
+                branch_name=branch_name,
+                org_id=org_id,
+                created_by=created_by,
+            )
 
-        result, error = await self._process_single_pdf(upload, branch_id=branch_id, branch_name=branch_name)
+        result, error = await self._process_single_pdf(
+            upload,
+            branch_id=branch_id,
+            branch_name=branch_name,
+            org_id=org_id,
+            created_by=created_by,
+        )
         successes = [result] if result else []
         failures = [error] if error else []
         chunks = result.chunks_indexed if result else 0
@@ -117,6 +139,9 @@ class DocumentIngestor:
         upload: UploadFile,
         branch_id: str | None = None,
         branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         try:
             stored = await self.storage_service.save_pdf(
@@ -137,6 +162,8 @@ class DocumentIngestor:
                 upload.filename or relative_path.name,
                 branch_id=branch_id,
                 branch_name=branch_name,
+                org_id=org_id,
+                created_by=created_by,
             )
             return result, error
         finally:
@@ -148,6 +175,9 @@ class DocumentIngestor:
         upload: UploadFile,
         branch_id: str | None = None,
         branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         try:
             archive_bytes = await upload.read()
@@ -199,6 +229,8 @@ class DocumentIngestor:
                             member_name,
                             branch_id=branch_id,
                             branch_name=branch_name,
+                            org_id=org_id,
+                            created_by=created_by,
                         )
                         if result:
                             successes.append(result)
@@ -228,6 +260,9 @@ class DocumentIngestor:
         source_label: str,
         branch_id: str | None = None,
         branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         document = self.pdf_processor.process_pdf(saved_path)
         if document is None:
@@ -254,7 +289,12 @@ class DocumentIngestor:
             )
 
         self.metadata_service.record_document(
-            relative_path, chunks_indexed, branch_id=branch_id, branch_name=branch_name
+            relative_path,
+            chunks_indexed,
+            branch_id=branch_id,
+            branch_name=branch_name,
+            org_id=org_id,
+            created_by=created_by,
         )
 
         directory = relative_path.parent.as_posix() if relative_path.parent.as_posix() != "." else ""

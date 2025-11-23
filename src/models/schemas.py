@@ -23,6 +23,7 @@ class DocumentUploadError(BaseModel):
 
 
 class DocumentListItem(BaseModel):
+    id: str | None = None
     filename: str
     relative_path: str
     directory: str

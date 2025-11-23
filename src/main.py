@@ -6,6 +6,7 @@ from logging.config import dictConfig
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.routes.auth import router as auth_router
 from src.api.routes.chat import rag_router, router as chat_router
 from src.api.routes.config import router as config_router
 from src.api.routes.documents import router as documents_router
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
         allow_methods=settings.cors_allow_methods,
         allow_headers=settings.cors_allow_headers,
     )
+    application.include_router(auth_router)
     application.include_router(chat_router)
     application.include_router(rag_router)
     application.include_router(documents_router)

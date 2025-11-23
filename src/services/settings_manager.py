@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Set, FrozenSet
+from typing import Any, Optional, Sequence
 
 import httpx
 from supabase import Client, create_client
@@ -11,27 +11,49 @@ from src.core.config import Settings
 
 
 @dataclass(frozen=True)
-class UserAccessProfile:
-    """Summary of group and folder access for a Supabase-authenticated user."""
+class RoleDefinition:
+    id: str
+    name: str
+    scope: str
+    permissions: frozenset[str]
 
+
+@dataclass(frozen=True)
+class AssignmentRecord:
+    id: str
+    role: RoleDefinition
+    branch_id: Optional[str]
+    group_id: Optional[str]
+    is_primary: bool
+
+
+@dataclass(frozen=True)
+class UserAccessProfile:
     user_id: str
+    org_id: Optional[str]
     role: str
     normalized_role: str
     branch_id: Optional[str]
     branch_name: Optional[str]
-    direct_group_ids: FrozenSet[str]
-    accessible_group_ids: FrozenSet[str]
-    folder_paths: FrozenSet[str]
+    branch_ids: frozenset[str]
+    branch_names: frozenset[str]
+    direct_group_ids: frozenset[str]
+    accessible_group_ids: frozenset[str]
+    folder_paths: frozenset[str]
     has_full_access: bool
+    permission_codes: frozenset[str]
+    assignments: tuple[AssignmentRecord, ...]
 
 
 class SettingsManager:
-    """Utility wrapper around Supabase tables needed for the Settings UI."""
+    """Wrapper around Supabase settings tables aligned with the new RBAC schema."""
 
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or logging.getLogger(__name__)
         self._settings = settings
         self._client: Optional[Client] = None
+        self._org_id_cache: Optional[str] = None
+        self._org_domain_cache: dict[str, str] = {}
 
         if settings.supabase_url and settings.supabase_key:
             try:
@@ -46,92 +68,763 @@ class SettingsManager:
             raise RuntimeError("Supabase client is not configured")
         return self._client
 
+    def _get_default_org_id(self, *, client: Optional[Client] = None) -> str:
+        if self._org_id_cache:
+            return self._org_id_cache
+
+        configured = self._settings.default_org_id
+        if configured:
+            self._org_id_cache = configured
+            return configured
+
+        client = client or self._require_client()
+        try:
+            response = client.table("organizations").select("id").limit(1).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to resolve organization identifier") from exc
+
+        records = response.data or []
+        if not records or not records[0].get("id"):
+            raise RuntimeError("No organizations are configured. Please seed the organizations table.")
+
+        org_id = str(records[0]["id"])
+        self._org_id_cache = org_id
+        return org_id
+
+    def _fetch_roles(self, role_ids: Sequence[str], *, client: Client) -> dict[str, RoleDefinition]:
+        if not role_ids:
+            return {}
+
+        sanitized = sorted({role_id for role_id in role_ids if role_id})
+        if not sanitized:
+            return {}
+
+        try:
+            response = (
+                client.table("roles")
+                .select("id, name, scope")
+                .in_("id", sanitized)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch roles: %s", exc)
+            return {}
+
+        role_map: dict[str, RoleDefinition] = {}
+        permission_map = self._fetch_role_permissions(sanitized, client=client)
+
+        for record in response.data or []:
+            role_id = str(record.get("id"))
+            if not role_id:
+                continue
+            role_map[role_id] = RoleDefinition(
+                id=role_id,
+                name=str(record.get("name") or "user"),
+                scope=str(record.get("scope") or "organization"),
+                permissions=frozenset(permission_map.get(role_id, set())),
+            )
+
+        return role_map
+
+    def _fetch_role_permissions(self, role_ids: Sequence[str], *, client: Client) -> dict[str, set[str]]:
+        if not role_ids:
+            return {}
+
+        sanitized = sorted({role_id for role_id in role_ids if role_id})
+        if not sanitized:
+            return {}
+
+        try:
+            response = (
+                client.table("role_permissions")
+                .select("role_id, permission_id")
+                .in_("role_id", sanitized)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch role permission mappings: %s", exc)
+            return {}
+
+        permission_ids = {str(record.get("permission_id")) for record in response.data or [] if record.get("permission_id")}
+        permission_lookup = self._fetch_permission_codes(permission_ids, client=client)
+
+        result: dict[str, set[str]] = {role_id: set() for role_id in sanitized}
+        for record in response.data or []:
+            role_id = str(record.get("role_id")) if record.get("role_id") else None
+            permission_id = str(record.get("permission_id")) if record.get("permission_id") else None
+            if not role_id or not permission_id:
+                continue
+            code = permission_lookup.get(permission_id)
+            if code:
+                result.setdefault(role_id, set()).add(code)
+
+        return result
+
+    def _fetch_permission_codes(self, permission_ids: set[str], *, client: Client) -> dict[str, str]:
+        if not permission_ids:
+            return {}
+
+        try:
+            response = (
+                client.table("permissions")
+                .select("id, code")
+                .in_("id", sorted(permission_ids))
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch permission codes: %s", exc)
+            return {}
+
+        return {
+            str(record.get("id")): str(record.get("code"))
+            for record in response.data or []
+            if record.get("id") and record.get("code")
+        }
+
+    def _fetch_branch_names(self, branch_ids: set[str], *, client: Client) -> dict[str, str]:
+        if not branch_ids:
+            return {}
+
+        try:
+            response = (
+                client.table("branches")
+                .select("id, name")
+                .in_("id", sorted(branch_ids))
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch branch names: %s", exc)
+            return {}
+
+        return {
+            str(record.get("id")): str(record.get("name"))
+            for record in response.data or []
+            if record.get("id") and record.get("name")
+        }
+
+    def _fetch_group_memberships(self, user_id: str, *, client: Client) -> set[str]:
+        try:
+            response = (
+                client.table("group_members")
+                .select("group_id")
+                .eq("user_id", user_id)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to fetch group memberships: %s", exc)
+            return set()
+
+        return {
+            str(record.get("group_id"))
+            for record in response.data or []
+            if record.get("group_id")
+        }
+
+    def _build_assignments(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        client: Client,
+    ) -> tuple[AssignmentRecord, ...]:
+        if not records:
+            return tuple()
+
+        role_ids = [str(record.get("role_id")) for record in records if record.get("role_id")]
+        roles = self._fetch_roles(role_ids, client=client)
+
+        assignments: list[AssignmentRecord] = []
+        for record in records:
+            role_id = str(record.get("role_id")) if record.get("role_id") else None
+            if not role_id:
+                continue
+            role = roles.get(role_id)
+            if role is None:
+                continue
+            assignments.append(
+                AssignmentRecord(
+                    id=str(record.get("id")),
+                    role=role,
+                    branch_id=str(record.get("branch_id")) if record.get("branch_id") else None,
+                    group_id=str(record.get("group_id")) if record.get("group_id") else None,
+                    is_primary=bool(record.get("is_primary_branch")),
+                )
+            )
+
+        return tuple(assignments)
+
+    def _normalize_role(self, assignments: Sequence[AssignmentRecord]) -> str:
+        # Return the actual role name without normalization
+        # If user has multiple roles, return the highest priority one
+        if not assignments:
+            return "Viewer"
+
+        # Priority order: OrgOwner > BranchManager > Contributor > Viewer
+        role_priority = {
+            "OrgOwner": 4,
+            "BranchManager": 3,
+            "Contributor": 2,
+            "Viewer": 1,
+        }
+
+        highest_role = max(
+            assignments,
+            key=lambda a: role_priority.get(a.role.name, 0)
+        )
+        return highest_role.role.name
+
+    def _build_user_profile(self, user_id: str, *, client: Client) -> UserAccessProfile:
+        org_id = self._resolve_org_for_user(user_id, client=client)
+        try:
+            response = (
+                client.table("user_assignments")
+                .select("id, role_id, branch_id, group_id, is_primary_branch")
+                .eq("user_id", user_id)
+                .eq("org_id", org_id)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to load user assignments: %s", exc)
+            assignments: tuple[AssignmentRecord, ...] = tuple()
+        else:
+            assignments = self._build_assignments(response.data or [], client=client)
+
+        branch_ids = {assignment.branch_id for assignment in assignments if assignment.branch_id}
+        branch_names_map = self._fetch_branch_names({branch_id for branch_id in branch_ids if branch_id}, client=client)
+        primary_assignment = next((assignment for assignment in assignments if assignment.is_primary), assignments[0] if assignments else None)
+        primary_branch_id = primary_assignment.branch_id if primary_assignment else None
+        primary_branch_name = branch_names_map.get(primary_branch_id) if primary_branch_id else None
+
+        group_ids = self._fetch_group_memberships(user_id, client=client)
+        accessible_groups = set(group_ids)
+
+        permission_codes = frozenset({code for assignment in assignments for code in assignment.role.permissions})
+        normalized_role = self._normalize_role(assignments)
+
+        return UserAccessProfile(
+            user_id=user_id,
+            org_id=org_id,
+            role=assignments[0].role.name if assignments else "Viewer",
+            normalized_role=normalized_role,
+            branch_id=primary_branch_id,
+            branch_name=primary_branch_name,
+            branch_ids=frozenset(branch_ids),
+            branch_names=frozenset(branch_names_map.get(branch_id, "") for branch_id in branch_ids if branch_id),
+            direct_group_ids=frozenset(group_ids),
+            accessible_group_ids=frozenset(accessible_groups),
+            folder_paths=frozenset(),
+            has_full_access=(normalized_role == "OrgOwner" or "ORG_MANAGE" in permission_codes),
+            permission_codes=permission_codes,
+            assignments=assignments,
+        )
+
+    def get_user_access_profile(self, user_id: str) -> UserAccessProfile:
+        client = self._require_client()
+        try:
+            return self._build_user_profile(user_id, client=client)
+        except Exception as exc:
+            self.logger.error("Failed to build access profile for %s: %s", user_id, exc)
+            return UserAccessProfile(
+                user_id=user_id,
+                org_id=None,
+                role="user",
+                normalized_role="user",
+                branch_id=None,
+                branch_name=None,
+                branch_ids=frozenset(),
+                branch_names=frozenset(),
+                direct_group_ids=frozenset(),
+                accessible_group_ids=frozenset(),
+                folder_paths=frozenset(),
+                has_full_access=False,
+                permission_codes=frozenset(),
+                assignments=tuple(),
+            )
+
     def get_user_role(self, user_id: str, *, client: Optional[Client] = None) -> str:
         client = client or self._require_client()
-        try:
-            response = (
-                client.table("user_roles")
-                .select("role")
-                .eq("user_id", user_id)
-                .limit(1)
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch user role for %s: %s", user_id, exc)
-            raise RuntimeError("Failed to fetch user role") from exc
+        profile = self._build_user_profile(user_id, client=client)
+        return profile.normalized_role
 
-        records = response.data or []
-        if not records:
-            return "user"
-        role = records[0].get("role")
-        return str(role) if role else "user"
-
-    def get_user_branch(self, user_id: str, *, client: Optional[Client] = None) -> tuple[Optional[str], Optional[str]]:
-        """Get user's branch_id and branch_name. Returns (None, None) for superadmins."""
+    def get_user_branch_assignments(self, user_id: str, *, client: Optional[Client] = None) -> tuple[list[str], list[str]]:
         client = client or self._require_client()
-        try:
-            response = (
-                client.table("user_roles")
-                .select("branch_id, branch_name")
-                .eq("user_id", user_id)
-                .limit(1)
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch user branch for %s: %s", user_id, exc)
-            return None, None
+        profile = self._build_user_profile(user_id, client=client)
+        branch_ids = list(profile.branch_ids)
+        branch_names = list(profile.branch_names)
+        return branch_ids, branch_names
 
-        records = response.data or []
-        if not records:
-            return None, None
-
-        branch_id = records[0].get("branch_id")
-        branch_name = records[0].get("branch_name")
-        return (str(branch_id) if branch_id else None, str(branch_name) if branch_name else None)
-
-    def list_groups(self) -> list[dict[str, Any]]:
+    def list_roles(self) -> list[dict[str, Any]]:
+        """List all platform-level roles (org_id is null)"""
         client = self._require_client()
         try:
-            response = client.table("groups").select("id, name, created_at").order("name").execute()
+            response = (
+                client.table("roles")
+                .select("id, name, description, scope")
+                .is_("org_id", "null")
+                .order("name")
+                .execute()
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list groups: %s", exc)
-            raise RuntimeError("Failed to list groups") from exc
+            raise RuntimeError("Failed to list roles") from exc
         return response.data or []
 
-    def create_group(self, *, name: str, created_by: Optional[str]) -> str:
-        """Create a new group and return its ID."""
+    def list_branches(self, *, org_id: Optional[str] = None) -> list[dict[str, Any]]:
         client = self._require_client()
-
-        # Check if group with this name already exists
+        resolved_org = org_id or self._get_default_org_id(client=client)
         try:
-            response = client.table("groups").select("id").eq("name", name).limit(1).execute()
-            if response.data:
-                raise RuntimeError(f"Group with name '{name}' already exists")
-        except RuntimeError:
-            raise
+            response = (
+                client.table("branches")
+                .select("id, name, created_at, code")
+                .eq("org_id", resolved_org)
+                .order("name")
+                .execute()
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to check for existing group: %s", exc)
-            raise RuntimeError("Failed to check for existing group") from exc
+            raise RuntimeError("Failed to list branches") from exc
+        return response.data or []
 
-        # Create the group
-        payload = {"name": name}
+    def create_branch(self, *, name: str, org_id: Optional[str] = None) -> str:
+        client = self._require_client()
+        resolved_org = org_id or self._get_default_org_id(client=client)
+        payload = {
+            "name": name,
+            "org_id": resolved_org,
+        }
+        try:
+            response = client.table("branches").insert(payload).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to create branch") from exc
+        record = (response.data or [None])[0]
+        if not record or not record.get("id"):
+            raise RuntimeError("Supabase did not return a branch identifier")
+        return str(record["id"])
+
+    def list_groups_paginated(self, *, offset: int, limit: int, search: str, requesting_user_id: Optional[str]) -> dict[str, Any]:
+        client = self._require_client()
+        if requesting_user_id:
+            org_id = self._resolve_org_for_user(requesting_user_id, client=client)
+        else:
+            org_id = self._get_default_org_id(client=client)
+
+        query = (
+            client.table("groups")
+            .select("id, name, created_at, description")
+            .eq("org_id", org_id)
+            .order("name")
+        )
+
+        if search:
+            query = query.ilike("name", f"%{search}%")
+
+        try:
+            response = query.range(offset, offset + limit - 1).execute()
+            count_response = (
+                client.table("groups")
+                .select("id", count="exact")
+                .eq("org_id", org_id)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to list groups") from exc
+
+        return {
+            "groups": response.data or [],
+            "total": count_response.count or 0,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def list_users_paginated(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        search: str,
+        requesting_user_id: Optional[str],
+    ) -> dict[str, Any]:
+        client = self._require_client()
+        if requesting_user_id:
+            org_id = self._resolve_org_for_user(requesting_user_id, client=client)
+        else:
+            org_id = self._get_default_org_id(client=client)
+
+        try:
+            response = (
+                client.table("user_assignments")
+                .select("id, user_id, role_id, branch_id")
+                .eq("org_id", org_id)
+                .order("created_at", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            count_response = (
+                client.table("user_assignments")
+                .select("id", count="exact")
+                .eq("org_id", org_id)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to list users") from exc
+
+        ordered_user_ids: list[str] = []
+        for record in response.data or []:
+            user_id = record.get("user_id")
+            if not user_id:
+                continue
+            normalized_user = str(user_id)
+            if normalized_user not in ordered_user_ids:
+                ordered_user_ids.append(normalized_user)
+
+        assignments_by_user: dict[str, list[dict[str, Any]]] = {}
+        if ordered_user_ids:
+            try:
+                all_assignments_response = (
+                    client.table("user_assignments")
+                    .select("id, user_id, role_id, branch_id")
+                    .eq("org_id", org_id)
+                    .in_("user_id", sorted(ordered_user_ids))
+                    .execute()
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                raise RuntimeError("Failed to load user assignments") from exc
+            for record in all_assignments_response.data or []:
+                user_id = record.get("user_id")
+                if not user_id:
+                    continue
+                assignments_by_user.setdefault(str(user_id), []).append(record)
+
+        role_ids = {str(record.get("role_id")) for record_list in assignments_by_user.values() for record in record_list if record.get("role_id")}
+        roles = self._fetch_roles(sorted(role_ids), client=client)
+        branch_ids = {str(record.get("branch_id")) for record_list in assignments_by_user.values() for record in record_list if record.get("branch_id")}
+        branch_names = self._fetch_branch_names(branch_ids, client=client)
+
+        email_lookup = self._fetch_emails_by_user_ids(client, set(assignments_by_user.keys()))
+
+        users: list[dict[str, Any]] = []
+        for user_id in ordered_user_ids:
+            records = assignments_by_user.get(user_id, [])
+            role = roles.get(str(records[0].get("role_id"))) if records else None
+            branch_list = [branch_names.get(str(record.get("branch_id"))) for record in records if record.get("branch_id")]
+            branch_ids_list = [str(record.get("branch_id")) for record in records if record.get("branch_id")]
+            users.append(
+                {
+                    "user_id": user_id,
+                    "role": role.name if role else "user",
+                    "email": email_lookup.get(user_id),
+                    "branch_ids": branch_ids_list,
+                    "branch_names": [name for name in branch_list if name],
+                }
+            )
+
+        if search:
+            needle = search.lower()
+            users = [
+                user
+                for user in users
+                if needle in (user.get("email") or "").lower()
+                or needle in (user.get("role") or "").lower()
+            ]
+
+        return {
+            "users": users,
+            "total": count_response.count or 0,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def list_group_members(self, requesting_user_id: Optional[str] = None, *, org_id: Optional[str] = None) -> list[dict[str, Any]]:
+        client = self._require_client()
+        resolved_org = org_id
+        if not resolved_org and requesting_user_id:
+            try:
+                resolved_org = self._resolve_org_for_user(requesting_user_id, client=client)
+            except Exception:
+                resolved_org = None
+
+        try:
+            response = client.table("group_members").select("id, group_id, user_id").execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to list group members") from exc
+
+        user_ids = {str(record.get("user_id")) for record in response.data or [] if record.get("user_id")}
+        emails = self._fetch_emails_by_user_ids(client, user_ids)
+
+        allowed_group_ids: Optional[Set[str]] = None
+        if resolved_org:
+            try:
+                group_resp = client.table("groups").select("id").eq("org_id", resolved_org).execute()
+                allowed_group_ids = {str(entry.get("id")) for entry in group_resp.data or [] if entry.get("id")}
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.warning("Failed to resolve groups for org %s: %s", resolved_org, exc)
+
+        members: list[dict[str, Any]] = []
+        for record in response.data or []:
+            user_id = record.get("user_id")
+            group_id = record.get("group_id")
+            if not user_id or not group_id:
+                continue
+            if allowed_group_ids is not None and group_id not in allowed_group_ids:
+                continue
+            members.append(
+                {
+                    "id": record.get("id"),
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "email": emails.get(str(user_id)),
+                }
+            )
+        return members
+
+    def create_group(self, *, name: str, created_by: Optional[str], branch_id: Optional[str] = None, org_id: Optional[str] = None) -> str:
+        client = self._require_client()
+        resolved_org = org_id or self._get_default_org_id(client=client)
+
+        payload = {
+            "name": name,
+            "org_id": resolved_org,
+        }
         if created_by:
             payload["created_by"] = created_by
+        if branch_id:
+            payload["branch_id"] = branch_id
 
         try:
             response = client.table("groups").insert(payload).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to create group '%s': %s", name, exc)
             raise RuntimeError("Failed to create group") from exc
 
-        if not response.data or len(response.data) == 0:
-            raise RuntimeError("Failed to create group - no data returned")
+        record = (response.data or [None])[0]
+        if not record or not record.get("id"):
+            raise RuntimeError("Supabase did not return a group identifier")
+        return str(record["id"])
 
-        group_id = response.data[0].get("id")
-        if not group_id:
-            raise RuntimeError("Failed to create group - no ID returned")
+    def add_user_to_groups(self, *, user_id: str, group_ids: Sequence[str], added_by: Optional[str]) -> None:
+        client = self._require_client()
+        payload = []
+        for group_id in group_ids:
+            payload.append(
+                {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "added_by": added_by,
+                }
+            )
+        if not payload:
+            return
+        try:
+            client.table("group_members").upsert(payload, on_conflict="group_id,user_id").execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to add user to groups") from exc
 
-        return str(group_id)
+    def remove_user_from_group(self, *, user_id: str, group_id: str) -> None:
+        client = self._require_client()
+        try:
+            client.table("group_members").delete().eq("user_id", user_id).eq("group_id", group_id).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Failed to remove user from group") from exc
+
+    def _find_role_id_by_name(self, role_name: Optional[str], *, client: Client, org_id: str) -> Optional[str]:
+        if not role_name:
+            return None
+
+        def _query(target_org: Optional[str]):
+            query = client.table("roles").select("id").ilike("name", role_name).limit(1)
+            if target_org is None:
+                query = query.is_("org_id", None)
+            else:
+                query = query.eq("org_id", target_org)
+            return query.execute()
+
+        try:
+            response = _query(org_id)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to lookup role %s: %s", role_name, exc)
+            return None
+
+        records = response.data or []
+        if not records:
+            try:
+                response = _query(None)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to lookup global role %s: %s", role_name, exc)
+                return None
+            records = response.data or []
+            if not records:
+                return None
+        role_id = records[0].get("id")
+        return str(role_id) if role_id else None
+
+    def _ensure_user_profile(self, user_id: str, *, org_id: str, client: Client) -> None:
+        payload = {
+            "user_id": user_id,
+            "org_id": org_id,
+        }
+        try:
+            client.table("user_profiles").upsert(payload, on_conflict="user_id").execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Failed to upsert user profile for %s: %s", user_id, exc)
+
+    def _find_user_id_by_email(self, email: str) -> Optional[str]:
+        supabase_url = self._settings.supabase_url
+        supabase_key = self._settings.supabase_key
+        if not supabase_url or not supabase_key:
+            return None
+
+        url = f"{supabase_url}/auth/v1/admin/users"
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+        }
+        params = {"email": email}
+
+        try:
+            response = httpx.get(url, headers=headers, params=params, timeout=10.0)
+        except httpx.HTTPError as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Admin API request failed for email %s: %s", email, exc)
+            return None
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        users = data.get("users") if isinstance(data, dict) else None
+        if not isinstance(users, list):
+            return None
+        for entry in users:
+            entry_email = entry.get("email")
+            if entry_email and entry_email.lower() == email.lower():
+                return str(entry.get("id"))
+        return None
+
+    def _fetch_emails_by_user_ids(self, client: Client, user_ids: set[str]) -> dict[str, Optional[str]]:
+        emails: dict[str, Optional[str]] = {}
+        for user_id in user_ids:
+            email = self._fetch_email_via_admin_api(user_id)
+            if email is not None:
+                emails[user_id] = email
+        return emails
+
+    def _extract_email_domain(self, email: Optional[str]) -> Optional[str]:
+        if not email or "@" not in email:
+            return None
+        return email.split("@", 1)[1].lower().strip()
+
+    def _get_or_create_org_for_domain(self, domain: str, *, client: Client) -> Optional[str]:
+        if not domain:
+            return None
+        cached = self._org_domain_cache.get(domain)
+        if cached:
+            return cached
+
+        try:
+            response = (
+                client.table("organizations")
+                .select("id, metadata")
+                .contains("metadata", {"domain": domain})
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to lookup organization for domain %s: %s", domain, exc)
+            return None
+
+        records = response.data or []
+        if not records:
+            payload = {
+                "name": domain,
+                "metadata": {"domain": domain},
+            }
+            try:
+                response = client.table("organizations").insert(payload).execute()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to create organization for domain %s: %s", domain, exc)
+                return None
+            records = response.data or []
+            if not records:
+                return None
+
+        org_id = records[0].get("id")
+        if not org_id:
+            return None
+        resolved = str(org_id)
+        self._org_domain_cache[domain] = resolved
+        return resolved
+
+    def _organization_has_assignments(self, org_id: str, *, client: Client) -> bool:
+        try:
+            response = (
+                client.table("user_assignments")
+                .select("id")
+                .eq("org_id", org_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Failed to inspect assignments for org %s: %s", org_id, exc)
+            return False
+        return bool(response.data)
+
+    def _assign_default_role_for_user(self, user_id: str, org_id: str, *, client: Client) -> None:
+        try:
+            response = (
+                client.table("user_assignments")
+                .select("id")
+                .eq("user_id", user_id)
+                .eq("org_id", org_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Failed to check existing assignments for %s: %s", user_id, exc)
+            return
+
+        if response.data:
+            return
+
+        role_name = "OrgOwner" if not self._organization_has_assignments(org_id, client=client) else "Viewer"
+        role_id = self._find_role_id_by_name(role_name, client=client, org_id=org_id)
+        if not role_id:
+            self.logger.warning("Role %s not found when assigning %s to org %s", role_name, user_id, org_id)
+            return
+
+        payload = {
+            "user_id": user_id,
+            "org_id": org_id,
+            "role_id": role_id,
+            "is_primary_branch": True,
+        }
+        try:
+            client.table("user_assignments").insert(payload).execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Failed to assign default role %s to %s: %s", role_name, user_id, exc)
+
+    def _resolve_org_for_user(self, user_id: str, *, client: Client) -> str:
+        try:
+            response = (
+                client.table("user_profiles")
+                .select("org_id")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Failed to lookup user profile for %s: %s", user_id, exc)
+            response = None
+
+        records = response.data if response else []
+        if records:
+            org_id = records[0].get("org_id")
+            if org_id:
+                return str(org_id)
+
+        email = self._fetch_email_via_admin_api(user_id)
+        domain = self._extract_email_domain(email)
+        org_id = self._get_or_create_org_for_domain(domain, client=client)
+        if not org_id:
+            org_id = self._get_default_org_id(client=client)
+
+        self._ensure_user_profile(user_id, org_id=org_id, client=client)
+        self._assign_default_role_for_user(user_id, org_id, client=client)
+        return org_id
 
     def _fetch_email_via_admin_api(self, user_id: str) -> Optional[str]:
         supabase_url = self._settings.supabase_url
@@ -151,624 +844,9 @@ class SettingsManager:
             return None
 
         if response.status_code == 200:
-            try:
-                payload = response.json()
-            except ValueError:  # pragma: no cover - defensive logging
-                self.logger.error("Admin API returned invalid JSON for %s", user_id)
-                return None
-
-            if isinstance(payload, dict):
-                email = payload.get("email")
-                if email:
-                    return str(email)
-                user = payload.get("user")
-                if isinstance(user, dict):
-                    user_email = user.get("email")
-                    return str(user_email) if user_email else None
-        elif response.status_code != 404:
-            self.logger.error(
-                "Admin API failed for %s: %s %s",
-                user_id,
-                response.status_code,
-                response.text,
-            )
+            payload = response.json()
+            return payload.get("email")
         return None
-
-    def _fetch_emails_by_user_ids(self, client: Client, user_ids: set[str]) -> dict[str, Optional[str]]:
-        if not user_ids:
-            return {}
-        try:
-            response = (
-                client.schema("auth")
-                .table("users")
-                .select("id, email")
-                .in_("id", list(user_ids))
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch user emails for %d users: %s", len(user_ids), exc)
-            response = None
-
-        emails: dict[str, Optional[str]] = {}
-        if response is not None:
-            for record in response.data or []:
-                profile_id = record.get("id")
-                if not profile_id:
-                    continue
-                email = record.get("email")
-                emails[str(profile_id)] = str(email) if email else None
-
-        missing_ids = [user_id for user_id in user_ids if user_id not in emails]
-        for user_id in missing_ids:
-            email = self._fetch_email_via_admin_api(user_id)
-            if email is not None:
-                emails[user_id] = email
-        return emails
-
-    def get_user_access_profile(self, user_id: str) -> UserAccessProfile:
-        """Return group and folder access information for the supplied user."""
-
-        try:
-            client = self._require_client()
-        except RuntimeError:
-            return UserAccessProfile(
-                user_id=user_id,
-                role="superadmin",
-                normalized_role="superadmin",
-                branch_id=None,
-                branch_name=None,
-                direct_group_ids=frozenset(),
-                accessible_group_ids=frozenset(),
-                folder_paths=frozenset(),
-                has_full_access=True,
-            )
-
-        try:
-            role = self.get_user_role(user_id, client=client)
-        except RuntimeError:
-            role = "user"
-
-        # Get user's branch information
-        branch_id, branch_name = self.get_user_branch(user_id, client=client)
-
-        # Normalize role to one of: superadmin, admin, user
-        normalized_role = str(role or "user").strip().lower().replace("-", "_").replace(" ", "_")
-
-        # Map various role names to the 3 standard roles
-        if normalized_role in {"superadmin", "super_admin"}:
-            normalized_role = "superadmin"
-        elif normalized_role in {"admin"}:
-            normalized_role = "admin"
-        else:
-            normalized_role = "user"
-
-        # Only superadmin has full access (can see everything)
-        has_full_access = normalized_role == "superadmin"
-
-        if has_full_access:
-            return UserAccessProfile(
-                user_id=user_id,
-                role=str(role or "admin"),
-                normalized_role=normalized_role or "admin",
-                branch_id=None,  # Superadmins have no branch restriction
-                branch_name="All Branches",
-                direct_group_ids=frozenset(),
-                accessible_group_ids=frozenset(),
-                folder_paths=frozenset(),
-                has_full_access=True,
-            )
-
-        direct_group_ids: Set[str] = set()
-        try:
-            response = (
-                client.table("group_members")
-                .select("group_id")
-                .eq("user_id", user_id)
-                .execute()
-            )
-            for record in response.data or []:
-                group_id = record.get("group_id")
-                if group_id:
-                    direct_group_ids.add(str(group_id))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch group memberships for %s: %s", user_id, exc)
-
-        accessible_group_ids: Set[str] = set(direct_group_ids)
-
-        adjacency: dict[str, Set[str]] = {}
-        try:
-            response = (
-                client.table("group_access")
-                .select("group_id, can_access_group_id")
-                .execute()
-            )
-            for record in response.data or []:
-                source = record.get("group_id")
-                target = record.get("can_access_group_id")
-                if not source or not target:
-                    continue
-                adjacency.setdefault(str(source), set()).add(str(target))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch group access rules: %s", exc)
-
-        queue: list[str] = list(accessible_group_ids)
-        while queue:
-            current = queue.pop()
-            for neighbor in adjacency.get(current, set()):
-                if neighbor not in accessible_group_ids:
-                    accessible_group_ids.add(neighbor)
-                    queue.append(neighbor)
-
-        folder_paths: Set[str] = set()
-        if accessible_group_ids:
-            try:
-                response = (
-                    client.table("group_folder_permissions")
-                    .select("group_id, folder_path")
-                    .in_("group_id", list(accessible_group_ids))
-                    .execute()
-                )
-                for record in response.data or []:
-                    folder_path = record.get("folder_path")
-                    if isinstance(folder_path, str):
-                        trimmed = folder_path.strip()
-                        folder_paths.add(trimmed)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                self.logger.error("Failed to fetch folder permissions for %s: %s", user_id, exc)
-
-        return UserAccessProfile(
-            user_id=user_id,
-            role=str(role or "user"),
-            normalized_role=normalized_role or "user",
-            branch_id=branch_id,
-            branch_name=branch_name,
-            direct_group_ids=frozenset(direct_group_ids),
-            accessible_group_ids=frozenset(accessible_group_ids),
-            folder_paths=frozenset(folder_paths),
-            has_full_access=False,
-        )
-
-    def list_group_members(self) -> list[dict[str, Any]]:
-        client = self._require_client()
-        try:
-            response = (
-                client.table("group_members")
-                .select("id, group_id, user_id")
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list group members: %s", exc)
-            raise RuntimeError("Failed to list group members") from exc
-
-        records = response.data or []
-        user_ids = {str(record.get("user_id")) for record in records if record.get("user_id")}
-        email_lookup = self._fetch_emails_by_user_ids(client, user_ids)
-
-        members: list[dict[str, Any]] = []
-        for record in records:
-            user_id = record.get("user_id")
-            members.append(
-                {
-                    "id": record.get("id"),
-                    "group_id": record.get("group_id"),
-                    "user_id": user_id,
-                    "email": email_lookup.get(str(user_id)),
-                }
-            )
-        return members
-
-    def list_group_access(self) -> list[dict[str, Any]]:
-        client = self._require_client()
-        try:
-            response = (
-                client.table("group_access")
-                .select("id, group_id, can_access_group_id, groups!group_access_can_access_group_id_fkey(name)")
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list group access rules: %s", exc)
-            raise RuntimeError("Failed to list group access rules") from exc
-
-        access_entries: list[dict[str, Any]] = []
-        for record in response.data or []:
-            access_group = record.get("groups")
-            access_entries.append(
-                {
-                    "id": record.get("id"),
-                    "group_id": record.get("group_id"),
-                    "can_access_group_id": record.get("can_access_group_id"),
-                    "can_access_group_name": access_group.get("name") if isinstance(access_group, dict) else None,
-                }
-            )
-        return access_entries
-
-    def list_group_folder_permissions(self) -> list[dict[str, Any]]:
-        client = self._require_client()
-        try:
-            response = (
-                client.table("group_folder_permissions")
-                .select("id, group_id, folder_path, granted_by, granted_at")
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list group folder permissions: %s", exc)
-            raise RuntimeError("Failed to list group folder permissions") from exc
-        return response.data or []
-
-    def list_all_users(self) -> list[dict[str, Any]]:
-        client = self._require_client()
-        try:
-            response = (
-                client.table("user_roles")
-                .select("id, user_id, role, branch_id, branch_name")
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list user roles: %s", exc)
-            raise RuntimeError("Failed to list users") from exc
-
-        records = response.data or []
-        user_ids = {str(record.get("user_id")) for record in records if record.get("user_id")}
-        email_lookup = self._fetch_emails_by_user_ids(client, user_ids)
-
-        users: list[dict[str, Any]] = []
-        for record in records:
-            user_id = record.get("user_id")
-            email = email_lookup.get(str(user_id))
-            users.append(
-                {
-                    "id": record.get("id"),
-                    "user_id": user_id,
-                    "role": record.get("role"),
-                    "email": email,
-                    "branch_id": record.get("branch_id"),
-                    "branch_name": record.get("branch_name"),
-                }
-            )
-        return users
-
-    def list_users_paginated(self, *, offset: int = 0, limit: int = 10, search: str = "") -> dict[str, Any]:
-        """Get paginated list of users with optional search"""
-        client = self._require_client()
-
-        try:
-            # Build query with search filter
-            query = client.table("user_roles").select("id, user_id, role, branch_id, branch_name", count="exact")
-
-            # Get total count first (for all matching records)
-            count_response = query.execute()
-            total_count = count_response.count or 0
-
-            # Now get paginated results
-            response = (
-                client.table("user_roles")
-                .select("id, user_id, role, branch_id, branch_name")
-                .range(offset, offset + limit - 1)
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list user roles paginated: %s", exc)
-            raise RuntimeError("Failed to list users") from exc
-
-        records = response.data or []
-        user_ids = {str(record.get("user_id")) for record in records if record.get("user_id")}
-        email_lookup = self._fetch_emails_by_user_ids(client, user_ids)
-
-        users: list[dict[str, Any]] = []
-        for record in records:
-            user_id = record.get("user_id")
-            email = email_lookup.get(str(user_id)) or ""
-
-            # Apply search filter on email and role
-            if search:
-                search_lower = search.lower()
-                if search_lower not in email.lower() and search_lower not in str(record.get("role", "")).lower():
-                    total_count -= 1
-                    continue
-
-            users.append(
-                {
-                    "id": record.get("id"),
-                    "user_id": user_id,
-                    "role": record.get("role"),
-                    "email": email,
-                    "branch_id": record.get("branch_id"),
-                    "branch_name": record.get("branch_name"),
-                }
-            )
-
-        return {
-            "users": users,
-            "total": total_count,
-            "offset": offset,
-            "limit": limit,
-        }
-
-    def list_groups_paginated(self, *, offset: int = 0, limit: int = 10, search: str = "") -> dict[str, Any]:
-        """Get paginated list of groups with optional search"""
-        client = self._require_client()
-
-        try:
-            # Build query with search filter
-            query = client.table("groups").select("*", count="exact")
-
-            if search:
-                query = query.ilike("name", f"%{search}%")
-
-            # Get total count
-            count_response = query.execute()
-            total_count = count_response.count or 0
-
-            # Get paginated results
-            query = client.table("groups").select("*")
-            if search:
-                query = query.ilike("name", f"%{search}%")
-
-            response = query.range(offset, offset + limit - 1).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list groups paginated: %s", exc)
-            raise RuntimeError("Failed to list groups") from exc
-
-        groups = response.data or []
-
-        # Get folder permissions for these groups
-        group_ids = [g.get("id") for g in groups if g.get("id")]
-        folders_by_group: dict[str, list[str]] = {}
-
-        if group_ids:
-            try:
-                folder_perms_response = (
-                    client.table("group_folder_permissions")
-                    .select("group_id, folder_path")
-                    .in_("group_id", group_ids)
-                    .execute()
-                )
-
-                for entry in (folder_perms_response.data or []):
-                    group_id = entry.get("group_id")
-                    folder_path = entry.get("folder_path")
-                    if group_id and folder_path:
-                        folders_by_group.setdefault(group_id, [])
-                        if folder_path not in folders_by_group[group_id]:
-                            folders_by_group[group_id].append(folder_path)
-            except Exception as exc:  # pragma: no cover
-                self.logger.error("Failed to fetch folder permissions: %s", exc)
-
-        # Add folder_paths to each group
-        for group in groups:
-            group_id = group.get("id")
-            if group_id and group_id in folders_by_group:
-                group["folder_paths"] = sorted(folders_by_group[group_id])
-
-        return {
-            "groups": groups,
-            "total": total_count,
-            "offset": offset,
-            "limit": limit,
-        }
-
-    def _find_user_id_by_email(self, email: str) -> Optional[str]:
-        client = self._require_client()
-        normalized_email = email.lower()
-        try:
-            response = (
-                client.schema("auth")
-                .table("users")
-                .select("id")
-                .eq("email", normalized_email)
-                .limit(1)
-                .execute()
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to look up user in auth.users for %s: %s", email, exc)
-            response = None
-
-        if response is not None:
-            records = response.data or []
-            if records:
-                user_id = records[0].get("id")
-                if user_id:
-                    return str(user_id)
-
-        # Fallback: attempt to use the admin API when enabled
-        if self._settings.supabase_url and self._settings.supabase_key:
-            url = f"{self._settings.supabase_url}/auth/v1/admin/users"
-            headers = {
-                "apikey": self._settings.supabase_key,
-                "Authorization": f"Bearer {self._settings.supabase_key}",
-                "Content-Type": "application/json",
-            }
-            try:
-                admin_response = httpx.get(
-                    url,
-                    headers=headers,
-                    params={"email": normalized_email},
-                    timeout=10.0,
-                )
-                if admin_response.status_code == 200:
-                    payload = admin_response.json()
-                    if isinstance(payload, dict):
-                        users = payload.get("users")
-                        if isinstance(users, list) and users:
-                            user_id = users[0].get("id")
-                            if user_id:
-                                return str(user_id)
-                elif admin_response.status_code == 404:
-                    return None
-                else:  # pragma: no cover - defensive logging
-                    self.logger.error(
-                        "Admin API email lookup failed for %s: %s %s",
-                        email,
-                        admin_response.status_code,
-                        admin_response.text,
-                    )
-            except httpx.HTTPError as exc:  # pragma: no cover - defensive logging
-                self.logger.error("Admin API lookup failed for %s: %s", email, exc)
-
-        return None
-
-    def assign_user_role(self, *, user_id: str, role: str, assigned_by: Optional[str], branch_id: Optional[str] = None, branch_name: Optional[str] = None) -> None:
-        client = self._require_client()
-        payload = {
-            "user_id": user_id,
-            "role": role,
-        }
-        if assigned_by:
-            payload["assigned_by"] = assigned_by
-
-        # Superadmins should have null branch_id
-        if role == "superadmin":
-            payload["branch_id"] = None
-            payload["branch_name"] = "All Branches"
-        else:
-            if branch_id:
-                payload["branch_id"] = branch_id
-            if branch_name:
-                payload["branch_name"] = branch_name
-
-        try:
-            client.table("user_roles").upsert(payload, on_conflict="user_id").execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to upsert role %s for %s: %s", role, user_id, exc)
-            raise RuntimeError("Failed to assign user role") from exc
-
-    def list_branches(self) -> list[dict[str, Any]]:
-        """Get all branches."""
-        client = self._require_client()
-        try:
-            response = client.table("branches").select("id, name, created_at").order("name").execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to list branches: %s", exc)
-            raise RuntimeError("Failed to list branches") from exc
-        return response.data or []
-
-    def create_branch(self, *, name: str) -> str:
-        """Create a new branch and return its ID."""
-        client = self._require_client()
-
-        try:
-            response = client.table("branches").select("id").eq("name", name).limit(1).execute()
-            if response.data:
-                raise RuntimeError(f"Branch with name '{name}' already exists")
-        except RuntimeError:
-            raise
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to check for existing branch: %s", exc)
-            raise RuntimeError("Failed to check for existing branch") from exc
-
-        payload = {"name": name}
-        try:
-            response = client.table("branches").insert(payload).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to create branch '%s': %s", name, exc)
-            raise RuntimeError("Failed to create branch") from exc
-
-        if not response.data or len(response.data) == 0:
-            raise RuntimeError("Failed to create branch - no data returned")
-
-        branch_id = response.data[0].get("id")
-        if not branch_id:
-            raise RuntimeError("Failed to create branch - no ID returned")
-
-        return str(branch_id)
-
-    def add_user_to_groups(self, *, user_id: str, group_ids: Sequence[str], added_by: Optional[str]) -> None:
-        client = self._require_client()
-
-        # If no groups specified, remove user from all groups
-        if not group_ids:
-            try:
-                client.table("group_members").delete().eq("user_id", user_id).execute()
-            except Exception as exc:  # pragma: no cover - defensive logging
-                self.logger.error("Failed to remove existing group memberships for %s: %s", user_id, exc)
-                raise RuntimeError("Failed to clear existing group memberships") from exc
-            return
-
-        # Get existing group memberships for this user
-        try:
-            response = client.table("group_members").select("group_id").eq("user_id", user_id).execute()
-            existing_group_ids = {record.get("group_id") for record in (response.data or [])}
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to fetch existing group memberships for %s: %s", user_id, exc)
-            raise RuntimeError("Failed to fetch existing group memberships") from exc
-
-        # Filter out groups the user is already a member of
-        new_group_ids = [gid for gid in group_ids if gid not in existing_group_ids]
-
-        if not new_group_ids:
-            # User is already a member of all specified groups
-            return
-
-        # Add user to the new groups
-        payload = []
-        for group_id in new_group_ids:
-            entry = {
-                "group_id": group_id,
-                "user_id": user_id,
-            }
-            if added_by:
-                entry["added_by"] = added_by
-            payload.append(entry)
-
-        try:
-            client.table("group_members").insert(payload).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to add group memberships for %s: %s", user_id, exc)
-            raise RuntimeError("Failed to add user to groups") from exc
-
-    def remove_user_from_group(self, *, user_id: str, group_id: str) -> None:
-        """Remove a user from a specific group."""
-        client = self._require_client()
-
-        try:
-            response = client.table("group_members").delete().eq("user_id", user_id).eq("group_id", group_id).execute()
-            if not response.data or len(response.data) == 0:
-                self.logger.warning("No group membership found for user %s in group %s", user_id, group_id)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to remove user %s from group %s: %s", user_id, group_id, exc)
-            raise RuntimeError("Failed to remove user from group") from exc
-
-    def grant_group_folder_permissions(
-        self,
-        *,
-        group_ids: Sequence[str],
-        folder_paths: Sequence[str],
-        granted_by: Optional[str],
-    ) -> None:
-        if not group_ids:
-            return
-
-        client = self._require_client()
-
-        # First, delete all existing folder permissions for these groups
-        try:
-            for group_id in group_ids:
-                client.table("group_folder_permissions").delete().eq("group_id", group_id).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to delete existing folder permissions: %s", exc)
-            raise RuntimeError("Failed to clear existing folder permissions") from exc
-
-        # If no folder_paths provided, we're done (user has no folder restrictions)
-        if not folder_paths:
-            return
-
-        # Now insert the new folder permissions
-        payload = []
-        for group_id in group_ids:
-            for folder_path in folder_paths:
-                entry = {
-                    "group_id": group_id,
-                    "folder_path": folder_path,
-                }
-                if granted_by:
-                    entry["granted_by"] = granted_by
-                payload.append(entry)
-
-        try:
-            client.table("group_folder_permissions").insert(payload).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to insert folder permissions: %s", exc)
-            raise RuntimeError("Failed to grant folder permissions") from exc
 
     def create_user_assignments(
         self,
@@ -778,124 +856,108 @@ class SettingsManager:
         group_ids: Sequence[str],
         folder_paths: Sequence[str],
         acting_user_id: Optional[str],
-        branch_id: Optional[str] = None,
-        branch_name: Optional[str] = None,
+        branch_ids: Optional[Sequence[str]] = None,
+        branch_names: Optional[Sequence[str]] = None,
+        org_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        client = self._require_client()
+        resolved_org = org_id
+        if not resolved_org and acting_user_id:
+            try:
+                resolved_org = self._resolve_org_for_user(acting_user_id, client=client)
+            except Exception:
+                resolved_org = None
+        if not resolved_org:
+            resolved_org = self._get_default_org_id(client=client)
         user_id = self._find_user_id_by_email(email)
         if not user_id:
-            raise RuntimeError("No Supabase profile found for the provided email")
+            raise RuntimeError("Could not find a Supabase user with that email")
 
-        if role:
-            self.assign_user_role(
-                user_id=user_id,
-                role=role,
-                assigned_by=acting_user_id,
-                branch_id=branch_id,
-                branch_name=branch_name,
+        role_id = self._find_role_id_by_name(role, client=client, org_id=resolved_org)
+        if not role_id:
+            raise RuntimeError("Role not found")
+
+        self._ensure_user_profile(user_id, org_id=resolved_org, client=client)
+
+        try:
+            delete_query = (
+                client.table("user_assignments")
+                .delete()
+                .eq("user_id", user_id)
+                .eq("org_id", resolved_org)
             )
-        self.add_user_to_groups(user_id=user_id, group_ids=group_ids, added_by=acting_user_id)
-        self.grant_group_folder_permissions(
-            group_ids=group_ids,
-            folder_paths=folder_paths,
-            granted_by=acting_user_id,
-        )
-        return {"user_id": user_id}
-
-    def replace_group_access(self, *, group_id: str, accessible_group_ids: Sequence[str], acting_user_id: Optional[str]) -> None:
-        client = self._require_client()
-        try:
-            client.table("group_access").delete().eq("group_id", group_id).execute()
+            if branch_ids:
+                delete_query = delete_query.in_("branch_id", branch_ids)
+            delete_query.execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to clear group access for %s: %s", group_id, exc)
-            raise RuntimeError("Failed to update group access") from exc
-
-        if not accessible_group_ids:
-            return
-
-        payload = []
-        for allowed_group in accessible_group_ids:
-            entry = {
-                "group_id": group_id,
-                "can_access_group_id": allowed_group,
-            }
-            if acting_user_id:
-                entry["granted_by"] = acting_user_id
-            payload.append(entry)
+            self.logger.warning("Failed to clear existing assignments for %s: %s", user_id, exc)
 
         try:
-            client.table("group_access").upsert(payload, on_conflict="group_id,can_access_group_id").execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to insert group access for %s: %s", group_id, exc)
-            raise RuntimeError("Failed to persist group access") from exc
-
-    def replace_group_folder_permissions(
-        self,
-        *,
-        group_id: str,
-        folder_paths: Sequence[str],
-        acting_user_id: Optional[str],
-    ) -> None:
-        client = self._require_client()
-        try:
-            client.table("group_folder_permissions").delete().eq("group_id", group_id).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to clear folder permissions for %s: %s", group_id, exc)
-            raise RuntimeError("Failed to update folder permissions") from exc
-
-        if not folder_paths:
-            return
-
-        payload = []
-        for folder_path in folder_paths:
-            entry = {
-                "group_id": group_id,
-                "folder_path": folder_path,
-            }
-            if acting_user_id:
-                entry["granted_by"] = acting_user_id
-            payload.append(entry)
-
-        try:
-            client.table("group_folder_permissions").upsert(
-                payload,
-                on_conflict="group_id,folder_path",
-            ).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to insert folder permissions for %s: %s", group_id, exc)
-            raise RuntimeError("Failed to persist folder permissions") from exc
-
-    def delete_user(self, *, target_user_id: str, acting_user_id: Optional[str]) -> None:
-        if acting_user_id and target_user_id == acting_user_id:
-            raise RuntimeError("You cannot remove your own account")
-
-        # Check if acting user is superadmin - only superadmins can delete users
-        if acting_user_id:
-            acting_user_role = self.get_user_role(acting_user_id)
-            normalized_acting_role = str(acting_user_role).strip().lower().replace("-", "_").replace(" ", "_")
-            if normalized_acting_role not in {"superadmin", "super_admin"}:
-                raise RuntimeError("Only superadmins can delete users")
-
-        client = self._require_client()
-        try:
-            response = (
-                client.table("user_roles")
-                .select("role")
-                .eq("user_id", target_user_id)
-                .limit(1)
+            primary_check = (
+                client.table("user_assignments")
+                .select("id")
+                .eq("user_id", user_id)
+                .eq("org_id", resolved_org)
                 .execute()
             )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to inspect role for %s: %s", target_user_id, exc)
-            raise RuntimeError("Failed to delete user") from exc
+        except Exception as exc:
+            self.logger.warning("Failed to check existing assignments for %s: %s", user_id, exc)
+            primary_check = None
+        has_primary = bool(primary_check and primary_check.data and len(primary_check.data) > 0)
 
-        records = response.data or []
-        existing_role = records[0].get("role") if records else None
-        if existing_role and str(existing_role).lower().replace("-", "_") == "superadmin":
-            raise RuntimeError("Cannot delete a superadmin account")
+        payload = []
+        target_branch_ids = list(branch_ids or [])
+        self.logger.info(
+            "Creating user assignments for %s with %d branches: %s",
+            user_id,
+            len(target_branch_ids),
+            target_branch_ids,
+        )
+        if not target_branch_ids:
+            payload.append(
+                {
+                    "user_id": user_id,
+                    "org_id": resolved_org,
+                    "role_id": role_id,
+                    "is_primary_branch": not has_primary,
+                }
+            )
+        else:
+            for index, branch_id in enumerate(target_branch_ids):
+                payload.append(
+                    {
+                        "user_id": user_id,
+                        "org_id": resolved_org,
+                        "role_id": role_id,
+                        "branch_id": branch_id,
+                        "is_primary_branch": index == 0 and not has_primary,
+                    }
+                )
+
+        self.logger.info("Inserting %d user_assignment records: %s", len(payload), payload)
+        if payload:
+            try:
+                result = client.table("user_assignments").insert(payload).execute()
+                self.logger.info("Successfully created %d user_assignment records", len(result.data or []))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error("Failed to insert user assignments: %s", exc)
+                raise RuntimeError("Failed to create role assignments") from exc
+
+        self.add_user_to_groups(user_id=user_id, group_ids=group_ids, added_by=acting_user_id)
+        return {"user_id": user_id}
+
+    def delete_user(self, *, target_user_id: str, acting_user_id: Optional[str]) -> None:
+        client = self._require_client()
+        if acting_user_id:
+            try:
+                org_id = self._resolve_org_for_user(acting_user_id, client=client)
+            except Exception:
+                org_id = self._get_default_org_id(client=client)
+        else:
+            org_id = self._get_default_org_id(client=client)
 
         try:
-            client.table("user_roles").delete().eq("user_id", target_user_id).execute()
+            client.table("user_assignments").delete().eq("user_id", target_user_id).eq("org_id", org_id).execute()
             client.table("group_members").delete().eq("user_id", target_user_id).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to remove user %s: %s", target_user_id, exc)
-            raise RuntimeError("Failed to delete user") from exc
+            raise RuntimeError("Failed to remove user") from exc

@@ -9,12 +9,12 @@ from src.core.config import Settings
 
 
 class ChatHistoryService:
-    """Persist chat interactions to Supabase."""
+    """Persist chat interactions to the new chat_sessions/chat_messages tables."""
 
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or logging.getLogger(__name__)
-        self.table_name = settings.supabase_chat_table
         self._client: Optional[Client] = None
+        self._org_id = settings.default_org_id or None
 
         if settings.supabase_url and settings.supabase_key:
             try:
@@ -24,9 +24,17 @@ class ChatHistoryService:
         else:
             self.logger.info("Supabase credentials not provided; chat history persistence disabled")
 
+        if self._client and not self._org_id:
+            self.logger.warning("DEFAULT_ORGANIZATION_ID is not configured; chat history upserts may fail")
+
     @property
     def enabled(self) -> bool:
         return self._client is not None
+
+    def _require_client(self) -> Client:
+        if self._client is None:
+            raise RuntimeError("Supabase chat history client is not configured")
+        return self._client
 
     def save_chat(
         self,
@@ -42,28 +50,46 @@ class ChatHistoryService:
         image_mime_type: Optional[str],
         interaction_type: str = "standard",
         metadata: Optional[dict[str, Any]] = None,
+        org_id: Optional[str] = None,
     ) -> None:
         if not self.enabled:
             return
 
-        payload = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "interaction_type": interaction_type,
-            "model_key": model_key,
-            "model_name": model_name,
-            "user_input": user_input,
-            "response": response,
-            "usage": usage,
-            "has_image": has_image,
-            "image_mime_type": image_mime_type,
-            "metadata": metadata,
+        client = self._require_client()
+        # Use provided org_id or fallback to default
+        effective_org_id = org_id or self._org_id
+
+        session_payload = {
+            "id": chat_id,
+            "org_id": effective_org_id,
+            "created_by": user_id,
+        }
+        try:
+            client.table("chat_sessions").upsert(session_payload, on_conflict="id").execute()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to upsert chat session %s: %s", chat_id, exc)
+
+        message_payload = {
+            "session_id": chat_id,
+            "sender_id": user_id,
+            "role": "assistant",
+            "content": response,
+            "metadata": {
+                "model_key": model_key,
+                "model_name": model_name,
+                "user_input": user_input,
+                "usage": usage,
+                "has_image": has_image,
+                "image_mime_type": image_mime_type,
+                "interaction_type": interaction_type,
+                "extra": metadata or {},
+            },
         }
 
         try:
-            self._client.table(self.table_name).insert(payload).execute()
+            client.table("chat_messages").insert(message_payload).execute()
         except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.error("Failed to persist chat history: %s", exc)
+            self.logger.error("Failed to persist chat message: %s", exc)
 
     def get_chat_history(
         self,
@@ -72,17 +98,13 @@ class ChatHistoryService:
         user_id: str,
         limit: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        if not self.enabled:
-            raise RuntimeError("Supabase chat history client is not configured")
-
+        client = self._require_client()
         query = (
-            self._client.table(self.table_name)
-            .select("*")
-            .eq("chat_id", chat_id)
-            .eq("user_id", user_id)
+            client.table("chat_messages")
+            .select("session_id, sender_id, role, content, metadata, created_at")
+            .eq("session_id", chat_id)
             .order("created_at", desc=False)
         )
-
         if limit is not None:
             query = query.limit(limit)
 
@@ -92,73 +114,97 @@ class ChatHistoryService:
             self.logger.error("Failed to fetch chat history: %s", exc)
             raise
 
-        return response.data or []
+        messages: list[dict[str, Any]] = []
+        for record in response.data or []:
+            meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            messages.append(
+                {
+                    "chat_id": record.get("session_id"),
+                    "user_id": user_id,
+                    "interaction_type": meta.get("interaction_type", "standard"),
+                    "model_key": meta.get("model_key"),
+                    "model_name": meta.get("model_name"),
+                    "user_input": meta.get("user_input"),
+                    "response": record.get("content"),
+                    "usage": meta.get("usage"),
+                    "has_image": meta.get("has_image", False),
+                    "image_mime_type": meta.get("image_mime_type"),
+                    "metadata": meta.get("extra") or {},
+                    "created_at": record.get("created_at"),
+                }
+            )
+        return messages
 
     def list_user_sessions(self, *, user_id: str) -> list[dict[str, Any]]:
-        if not self.enabled:
-            raise RuntimeError("Supabase chat history client is not configured")
-
+        client = self._require_client()
         try:
-            response = (
-                self._client.table(self.table_name)
-                .select("*")
-                .eq("user_id", user_id)
-                .order("created_at", desc=True)
+            sessions_response = (
+                client.table("chat_sessions")
+                .select("id, created_by, updated_at")
+                .eq("created_by", user_id)
+                .order("updated_at", desc=True)
                 .execute()
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.error("Failed to list chat sessions: %s", exc)
             raise
 
-        records = response.data or []
-        sessions: dict[str, dict[str, Any]] = {}
-        ordered_ids: list[str] = []
-
-        for record in records:
-            chat_id = record.get("chat_id")
-            if not chat_id:
-                continue
-
-            created_at = record.get("created_at")
-            session = sessions.get(chat_id)
-            if session is None:
-                session = {
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "message_count": 0,
-                    "last_message": None,
-                    "last_user_input": None,
-                    "last_model_key": None,
-                    "last_interaction_type": None,
-                    "last_interaction_at": created_at,
-                }
-                sessions[chat_id] = session
-                ordered_ids.append(chat_id)
-
-            session["message_count"] += 1
-
-            if created_at and (
-                session["last_interaction_at"] is None
-                or created_at >= session["last_interaction_at"]
-            ):
-                session["last_interaction_at"] = created_at
-                session["last_message"] = record.get("response")
-                session["last_user_input"] = record.get("user_input")
-                session["last_model_key"] = record.get("model_key")
-                session["last_interaction_type"] = record.get("interaction_type")
-
-        return [sessions[chat_id] for chat_id in ordered_ids]
-
-    def delete_chat_session(self, *, chat_id: str, user_id: str) -> int:
-        if not self.enabled:
-            raise RuntimeError("Supabase chat history client is not configured")
+        session_ids = [record.get("id") for record in sessions_response.data or [] if record.get("id")]
+        if not session_ids:
+            return []
 
         try:
+            messages_response = (
+                client.table("chat_messages")
+                .select("session_id, created_at, metadata, content")
+                .in_("session_id", session_ids)
+                .order("created_at", desc=True)
+                .execute()
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.error("Failed to load chat messages for sessions: %s", exc)
+            raise
+
+        session_stats: dict[str, dict[str, Any]] = {
+            session_id: {
+                "chat_id": session_id,
+                "user_id": user_id,
+                "message_count": 0,
+                "last_message": None,
+                "last_user_input": None,
+                "last_model_key": None,
+                "last_interaction_type": None,
+                "last_interaction_at": None,
+            }
+            for session_id in session_ids
+        }
+
+        for record in messages_response.data or []:
+            session_id = record.get("session_id")
+            stats = session_stats.get(session_id)
+            if not stats:
+                continue
+            stats["message_count"] += 1
+            created_at = record.get("created_at")
+            meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            if created_at and (stats["last_interaction_at"] is None or created_at >= stats["last_interaction_at"]):
+                stats["last_interaction_at"] = created_at
+                stats["last_message"] = record.get("content")
+                stats["last_user_input"] = meta.get("user_input")
+                stats["last_model_key"] = meta.get("model_key")
+                stats["last_interaction_type"] = meta.get("interaction_type")
+
+        return list(session_stats.values())
+
+    def delete_chat_session(self, *, chat_id: str, user_id: str) -> int:
+        client = self._require_client()
+        try:
+            client.table("chat_messages").delete().eq("session_id", chat_id).execute()
             response = (
-                self._client.table(self.table_name)
+                client.table("chat_sessions")
                 .delete()
-                .eq("chat_id", chat_id)
-                .eq("user_id", user_id)
+                .eq("id", chat_id)
+                .eq("created_by", user_id)
                 .execute()
             )
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -168,10 +214,7 @@ class ChatHistoryService:
         deleted = getattr(response, "count", None)
         if isinstance(deleted, int):
             return deleted
-
-        # If Supabase client doesn't return a count, fall back to length of data
         data = getattr(response, "data", None)
         if isinstance(data, list):
             return len(data)
-
         return 0
