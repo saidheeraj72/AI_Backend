@@ -16,3 +16,4 @@ pdfplumber
 camelot-py[cv]
 numpy
 PyPDF2
+mangum
