@@ -205,6 +205,93 @@ async def get_settings_data(current_user: SupabaseUser = Depends(require_supabas
     }
 
 
+@router.get("/profile", response_model=dict[str, Any])
+async def get_user_settings_profile(current_user: SupabaseUser = Depends(require_supabase_user)) -> dict[str, Any]:
+    """Get current user's settings profile and role"""
+    try:
+        profile = settings_manager.get_user_access_profile(current_user.id)
+        normalized_role = profile.normalized_role
+
+        has_admin_permission = (
+            normalized_role in {"OrgOwner", "BranchManager"} or
+            "ORG_MANAGE" in profile.permission_codes or
+            "BRANCH_ADMIN" in profile.permission_codes
+        )
+
+        if not has_admin_permission:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only OrgOwner and BranchManager users can access settings"
+            )
+
+        return {"user_role": normalized_role}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+
+@router.get("/groups/configuration", response_model=dict[str, Any])
+async def get_groups_configuration(current_user: SupabaseUser = Depends(require_supabase_user)) -> dict[str, Any]:
+    """Get group members, access, and folder permissions"""
+    try:
+        profile = settings_manager.get_user_access_profile(current_user.id)
+        normalized_role = profile.normalized_role
+
+        if normalized_role not in {"OrgOwner", "BranchManager"}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only OrgOwner and BranchManager users can access group configuration"
+            )
+
+        group_members = settings_manager.list_group_members(
+            requesting_user_id=current_user.id,
+            org_id=profile.org_id,
+        )
+        
+        org_context = profile.org_id or settings.default_org_id
+        if org_context:
+            group_folder_permissions = folder_permissions_service.list_group_folder_permissions(org_id=org_context)
+        else:
+            group_folder_permissions = []
+            
+        # Note: group_access retrieval logic might need to be added here if it's distinct from general settings
+        # For now returning empty list as per original monolithic endpoint if not explicitly fetched elsewhere
+        group_access: list[dict[str, Any]] = [] 
+
+        return {
+            "group_members": group_members,
+            "group_access": group_access,
+            "group_folder_permissions": group_folder_permissions,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+
+@router.get("/folders/tree", response_model=dict[str, Any])
+async def get_folder_tree_data(current_user: SupabaseUser = Depends(require_supabase_user)) -> dict[str, Any]:
+    """Get folder structure and tree"""
+    try:
+        profile = settings_manager.get_user_access_profile(current_user.id)
+        normalized_role = profile.normalized_role
+
+        if normalized_role not in {"OrgOwner", "BranchManager"}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only OrgOwner and BranchManager users can access folder tree"
+            )
+
+        user_branch_ids = list(profile.branch_ids)
+        
+        directories = _collect_unique_directories(branch_ids=user_branch_ids, org_id=profile.org_id)
+        folder_tree = _build_folder_tree(branch_ids=user_branch_ids, org_id=profile.org_id)
+
+        return {
+            "folders": directories,
+            "folder_tree": folder_tree,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+
 @router.get("/users/paginated", response_model=dict[str, Any])
 async def get_paginated_users(
     offset: int = 0,
