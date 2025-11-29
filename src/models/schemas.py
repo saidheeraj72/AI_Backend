@@ -1,11 +1,257 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
 from enum import Enum
-from typing import Any
+from typing import Any, List, Optional
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
+# --- Enums ---
+
+class RoleType(str, Enum):
+    ADMIN = "Admin"
+    BRANCH_MANAGER = "Branch Manager"
+    VIEWER = "Viewer"
+
+class TeamProfileStatus(str, Enum):
+    ACTIVE = "Active"
+    ARCHIVED = "Archived"
+    ON_LEAVE = "OnLeave"
+
+class ChatRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+# --- Base Models ---
+
+class OrganizationBase(BaseModel):
+    name: str
+    slug: str
+    domain: Optional[str] = None
+
+class OrganizationCreate(OrganizationBase):
+    pass
+
+class Organization(OrganizationBase):
+    id: UUID
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class BranchBase(BaseModel):
+    name: str
+    code: str
+    location: str
+    timezone: Optional[str] = "UTC"
+
+class BranchCreate(BranchBase):
+    organization_id: UUID
+
+class Branch(BranchBase):
+    id: UUID
+    organization_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    user_count: Optional[int] = 0
+
+    class Config:
+        from_attributes = True
+
+class Role(BaseModel):
+    id: UUID
+    organization_id: Optional[UUID] = None
+    name: str
+    permissions: dict = Field(default_factory=dict)
+    is_system_role: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class Profile(BaseModel):
+    id: UUID
+    email: EmailStr
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class OrganizationMember(BaseModel):
+    id: UUID
+    organization_id: UUID
+    user_id: UUID
+    role_id: Optional[UUID] = None
+    joined_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class BranchMember(BaseModel):
+    id: UUID
+    branch_id: UUID
+    user_id: UUID
+    role_id: Optional[UUID] = None
+    is_primary_branch: bool
+    joined_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class Group(BaseModel):
+    id: UUID
+    organization_id: UUID
+    branch_id: Optional[UUID] = None
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# --- Team Profiles ---
+
+class TeamSkill(BaseModel):
+    id: UUID
+    skill_name: str
+    proficiency: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class TeamQualification(BaseModel):
+    id: UUID
+    degree: str
+    institution: Optional[str] = None
+    year_completed: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+class TeamExperience(BaseModel):
+    id: UUID
+    company: str
+    role: str
+    years_duration: Optional[float] = None
+    description: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class TeamProfileBase(BaseModel):
+    employee_code: Optional[str] = None
+    job_title: Optional[str] = None
+    department: Optional[str] = None
+    weekly_hours: Optional[float] = 40.00
+    overtime_allowed: Optional[bool] = False
+    daily_timings_from: Optional[time] = None
+    daily_timings_to: Optional[time] = None
+    timezone: Optional[str] = None
+    employment_start_date: Optional[date] = None
+    employment_end_date: Optional[date] = None
+    billing_rate: Optional[float] = None
+    billing_currency: Optional[str] = "USD"
+    profile_summary: Optional[str] = None
+    is_active: bool = True
+    status: Optional[str] = "Active"
+
+class TeamProfile(TeamProfileBase):
+    id: UUID
+    organization_id: UUID
+    reporting_manager_id: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+    skills: List[TeamSkill] = Field(default_factory=list)
+    qualifications: List[TeamQualification] = Field(default_factory=list)
+    experience: List[TeamExperience] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
+# --- DMS ---
+
+class Folder(BaseModel):
+    id: UUID
+    branch_id: UUID
+    parent_id: Optional[UUID] = None
+    name: str
+    description: Optional[str] = None
+    created_by: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class FolderCreate(BaseModel):
+    branch_id: UUID
+    parent_id: Optional[UUID] = None
+    name: str
+    description: Optional[str] = None
+
+class Document(BaseModel):
+    id: UUID
+    branch_id: UUID
+    folder_id: Optional[UUID] = None
+    owner_id: Optional[UUID] = None
+    title: str
+    description: Optional[str] = None
+    status: str = "pending_review"
+    storage_path: str
+    file_size: Optional[int] = None
+    mime_type: Optional[str] = None
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class FolderPermission(BaseModel):
+    id: UUID
+    folder_id: UUID
+    user_id: Optional[UUID] = None
+    group_id: Optional[UUID] = None
+    can_view: bool = True
+    can_upload: bool = False
+    can_edit: bool = False
+    can_delete: bool = False
+
+    class Config:
+        from_attributes = True
+
+# --- Chat ---
+
+class ChatSession(BaseModel):
+    id: UUID
+    user_id: UUID
+    title: Optional[str] = "New Chat"
+    model: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class ChatMessage(BaseModel):
+    id: UUID
+    session_id: UUID
+    role: ChatRole
+    content: str
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# --- Existing RAG/API Models (Updated where needed) ---
 
 class DocumentUploadResult(BaseModel):
     filename: str
@@ -13,8 +259,10 @@ class DocumentUploadResult(BaseModel):
     directory: str
     chunks_indexed: int
     message: str
-    branch_id: str | None = None
-    branch_name: str | None = None
+    branch_id: Optional[UUID] = None
+    branch_name: Optional[str] = None
+    description: Optional[str] = None
+    status: str = "pending_review"
 
 
 class DocumentUploadError(BaseModel):
@@ -23,22 +271,32 @@ class DocumentUploadError(BaseModel):
 
 
 class DocumentListItem(BaseModel):
-    id: str | None = None
+    id: Optional[UUID] = None
     filename: str
     relative_path: str
     directory: str
     chunks_indexed: int
-    branch_id: str | None = None
-    branch_name: str | None = None
+    branch_id: Optional[UUID] = None
+    branch_name: Optional[str] = None
+    description: Optional[str] = None
+    status: str = "pending_review"
+    owner_email: Optional[str] = None
+    reviewer_email: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+
+
+class DocumentReviewRequest(BaseModel):
+    document_id: UUID
+    status: str = Field(..., pattern="^(approved|rejected)$")
 
 
 class DocumentListResponse(BaseModel):
-    documents: list[DocumentListItem] = Field(default_factory=list)
+    documents: List[DocumentListItem] = Field(default_factory=list)
 
 
 class DocumentIngestResponse(BaseModel):
-    successes: list[DocumentUploadResult] = Field(default_factory=list)
-    failures: list[DocumentUploadError] = Field(default_factory=list)
+    successes: List[DocumentUploadResult] = Field(default_factory=list)
+    failures: List[DocumentUploadError] = Field(default_factory=list)
     total_chunks_indexed: int
 
 
@@ -46,28 +304,29 @@ class ChatResponse(BaseModel):
     model_key: str
     model_name: str
     response: str
-    usage: dict[str, int] | None = None
-    chat_id: str | None = None
+    usage: Optional[dict[str, int]] = None
+    chat_id: Optional[str] = None
 
 
 class RAGSource(BaseModel):
     filename: str
-    download_url: str | None = None
+    download_url: Optional[str] = None
 
 
 class RAGChatResponse(ChatResponse):
     question: str
-    sources: list[RAGSource] = Field(default_factory=list)
+    sources: List[RAGSource] = Field(default_factory=list)
 
 
 class RAGChatRequest(BaseModel):
     question: str
     model_key: str = Field(default="complex")
-    document_paths: list[str] | None = Field(default=None, description="Relative paths of selected documents")
+    document_paths: Optional[List[str]] = Field(default=None, description="Relative paths of selected documents")
     use_all: bool = Field(default=False, description="Ignore document_paths and search across all documents")
     top_k: int = Field(default=4, ge=1, le=20)
     user_id: str = Field(..., description="Supabase auth identifier for the requesting user")
-    chat_session_id: str | None = Field(None, description="Conversation identifier to group related messages")
+    chat_session_id: Optional[str] = Field(None, description="Conversation identifier to group related messages")
+    branch_id: Optional[UUID] = Field(None, description="Context branch ID")
 
 
 class ChatHistoryMessage(BaseModel):
@@ -76,34 +335,34 @@ class ChatHistoryMessage(BaseModel):
     interaction_type: str
     model_key: str
     model_name: str
-    user_input: str | None
+    user_input: Optional[str]
     response: str
-    usage: dict[str, Any] | None = None
+    usage: Optional[dict[str, Any]] = None
     has_image: bool
-    image_mime_type: str | None = None
-    metadata: dict[str, Any] | None = None
+    image_mime_type: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
     created_at: datetime
 
 
 class ChatHistoryResponse(BaseModel):
     chat_id: str
-    messages: list[ChatHistoryMessage] = Field(default_factory=list)
+    messages: List[ChatHistoryMessage] = Field(default_factory=list)
 
 
 class ChatSessionSummary(BaseModel):
     chat_id: str
     user_id: str
     message_count: int
-    last_message: str | None = None
-    last_user_input: str | None = None
-    last_model_key: str | None = None
-    last_interaction_type: str | None = None
+    last_message: Optional[str] = None
+    last_user_input: Optional[str] = None
+    last_model_key: Optional[str] = None
+    last_interaction_type: Optional[str] = None
     last_interaction_at: datetime
 
 
 class ChatSessionListResponse(BaseModel):
     user_id: str
-    sessions: list[ChatSessionSummary] = Field(default_factory=list)
+    sessions: List[ChatSessionSummary] = Field(default_factory=list)
 
 
 class ChatHistoryScope(str, Enum):
@@ -116,5 +375,5 @@ class DocumentSearchRequest(BaseModel):
 
 
 class DocumentSearchResponse(BaseModel):
-    documents: list[DocumentListItem] = Field(default_factory=list)
+    documents: List[DocumentListItem] = Field(default_factory=list)
     total_count: int = Field(description="Total number of matching documents")

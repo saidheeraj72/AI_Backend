@@ -60,6 +60,7 @@ class DocumentIngestor:
         *,
         org_id: str | None = None,
         created_by: str | None = None,
+        description: str | None = None,
     ) -> DocumentIngestResponse:
         successes: List[DocumentUploadResult] = []
         failures: List[DocumentUploadError] = []
@@ -73,6 +74,7 @@ class DocumentIngestor:
                     branch_name=branch_name,
                     org_id=org_id,
                     created_by=created_by,
+                    description=description,
                 )
                 successes.extend(file_successes)
                 failures.extend(file_failures)
@@ -103,6 +105,7 @@ class DocumentIngestor:
         *,
         org_id: str | None = None,
         created_by: str | None = None,
+        description: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         filename = upload.filename or ""
         if not filename:
@@ -120,6 +123,7 @@ class DocumentIngestor:
                 branch_name=branch_name,
                 org_id=org_id,
                 created_by=created_by,
+                description=description,
             )
 
         result, error = await self._process_single_pdf(
@@ -128,6 +132,7 @@ class DocumentIngestor:
             branch_name=branch_name,
             org_id=org_id,
             created_by=created_by,
+            description=description,
         )
         successes = [result] if result else []
         failures = [error] if error else []
@@ -142,6 +147,7 @@ class DocumentIngestor:
         *,
         org_id: str | None = None,
         created_by: str | None = None,
+        description: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         try:
             stored = await self.storage_service.save_pdf(
@@ -164,6 +170,7 @@ class DocumentIngestor:
                 branch_name=branch_name,
                 org_id=org_id,
                 created_by=created_by,
+                description=description,
             )
             return result, error
         finally:
@@ -178,6 +185,7 @@ class DocumentIngestor:
         *,
         org_id: str | None = None,
         created_by: str | None = None,
+        description: str | None = None,
     ) -> Tuple[List[DocumentUploadResult], List[DocumentUploadError], int]:
         try:
             archive_bytes = await upload.read()
@@ -231,6 +239,7 @@ class DocumentIngestor:
                             branch_name=branch_name,
                             org_id=org_id,
                             created_by=created_by,
+                            description=description,
                         )
                         if result:
                             successes.append(result)
@@ -263,6 +272,7 @@ class DocumentIngestor:
         *,
         org_id: str | None = None,
         created_by: str | None = None,
+        description: str | None = None,
     ) -> Tuple[DocumentUploadResult | None, DocumentUploadError | None]:
         document = self.pdf_processor.process_pdf(saved_path)
         if document is None:
@@ -295,6 +305,7 @@ class DocumentIngestor:
             branch_name=branch_name,
             org_id=org_id,
             created_by=created_by,
+            description=description,
         )
 
         directory = relative_path.parent.as_posix() if relative_path.parent.as_posix() != "." else ""
@@ -306,6 +317,8 @@ class DocumentIngestor:
             message="PDF processed and indexed successfully",
             branch_id=branch_id,
             branch_name=branch_name,
+            description=description,
+            status="pending_review"
         )
 
         return result, None

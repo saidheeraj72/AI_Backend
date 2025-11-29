@@ -14,18 +14,12 @@ class ChatHistoryService:
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.logger = logger or logging.getLogger(__name__)
         self._client: Optional[Client] = None
-        self._org_id = settings.default_org_id or None
-
+        
         if settings.supabase_url and settings.supabase_key:
             try:
                 self._client = create_client(settings.supabase_url, settings.supabase_key)
-            except Exception as exc:  # pragma: no cover - defensive logging
+            except Exception as exc:
                 self.logger.error("Failed to initialize Supabase client: %s", exc)
-        else:
-            self.logger.info("Supabase credentials not provided; chat history persistence disabled")
-
-        if self._client and not self._org_id:
-            self.logger.warning("DEFAULT_ORGANIZATION_ID is not configured; chat history upserts may fail")
 
     @property
     def enabled(self) -> bool:
@@ -56,23 +50,26 @@ class ChatHistoryService:
             return
 
         client = self._require_client()
-        # Use provided org_id or fallback to default
-        effective_org_id = org_id or self._org_id
 
+        # Update session (upsert)
         session_payload = {
             "id": chat_id,
-            "org_id": effective_org_id,
-            "created_by": user_id,
+            "user_id": user_id,
+            "model": model_key,
+            # "org_id": org_id # No longer in schema, potentially in metadata if needed?
         }
         try:
             client.table("chat_sessions").upsert(session_payload, on_conflict="id").execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to upsert chat session %s: %s", chat_id, exc)
 
+        # We are storing "interactions" where one message row contains both user input (in metadata) and response.
+        # This is to maintain compatibility with existing frontend logic without full refactor.
+        # Ideally, we should store two rows: one user message, one assistant message.
+        
         message_payload = {
             "session_id": chat_id,
-            "sender_id": user_id,
-            "role": "assistant",
+            "role": "assistant", # It's the response
             "content": response,
             "metadata": {
                 "model_key": model_key,
@@ -88,7 +85,7 @@ class ChatHistoryService:
 
         try:
             client.table("chat_messages").insert(message_payload).execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to persist chat message: %s", exc)
 
     def get_chat_history(
@@ -101,7 +98,7 @@ class ChatHistoryService:
         client = self._require_client()
         query = (
             client.table("chat_messages")
-            .select("session_id, sender_id, role, content, metadata, created_at")
+            .select("session_id, role, content, metadata, created_at")
             .eq("session_id", chat_id)
             .order("created_at", desc=False)
         )
@@ -110,7 +107,7 @@ class ChatHistoryService:
 
         try:
             response = query.execute()
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to fetch chat history: %s", exc)
             raise
 
@@ -140,12 +137,12 @@ class ChatHistoryService:
         try:
             sessions_response = (
                 client.table("chat_sessions")
-                .select("id, created_by, updated_at")
-                .eq("created_by", user_id)
+                .select("id, user_id, updated_at")
+                .eq("user_id", user_id)
                 .order("updated_at", desc=True)
                 .execute()
             )
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to list chat sessions: %s", exc)
             raise
 
@@ -161,7 +158,7 @@ class ChatHistoryService:
                 .order("created_at", desc=True)
                 .execute()
             )
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to load chat messages for sessions: %s", exc)
             raise
 
@@ -199,15 +196,16 @@ class ChatHistoryService:
     def delete_chat_session(self, *, chat_id: str, user_id: str) -> int:
         client = self._require_client()
         try:
+            # Cascade delete should handle messages, but we can delete explicitly too.
             client.table("chat_messages").delete().eq("session_id", chat_id).execute()
             response = (
                 client.table("chat_sessions")
                 .delete()
                 .eq("id", chat_id)
-                .eq("created_by", user_id)
+                .eq("user_id", user_id)
                 .execute()
             )
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:
             self.logger.error("Failed to delete chat session: %s", exc)
             raise
 
