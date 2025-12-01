@@ -9,7 +9,7 @@ import json
 # PDF Processing
 import camelot
 import PyPDF2
-
+    
 # Embeddings and Vector Store
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
