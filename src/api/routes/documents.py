@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, List
+from pathlib import Path
 
 from functools import partial
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 
 from src.api.dependencies.auth import SupabaseUser, require_supabase_user
@@ -17,7 +19,6 @@ from src.models.schemas import (
     DocumentListResponse,
     DocumentSearchRequest,
     DocumentSearchResponse,
-    DocumentReviewRequest,
     Folder,
     FolderCreate,
 )
@@ -71,14 +72,11 @@ async def create_folder(
     """
     Create a new folder explicitly.
     """
-    # Verify user access to branch (omitted for brevity, assume handled or minimal check)
-    # TODO: Strict permission check
-    
-    # parent_id is optional. If provided, it must exist.
-    # We use the branch_id from request.
+    if not folder.branch_ids:
+         raise HTTPException(status_code=400, detail="At least one branch_id is required")
     
     result = metadata_service.create_folder(
-        branch_id=str(folder.branch_id),
+        branch_ids=[str(bid) for bid in folder.branch_ids],
         name=folder.name,
         parent_id=str(folder.parent_id) if folder.parent_id else None,
         description=folder.description,
@@ -90,38 +88,21 @@ async def create_folder(
         
     return Folder(**result)
 
-@router.post("/upload", response_model=DocumentIngestResponse)
+@router.post("/upload")
 async def upload_document(
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     relative_paths: list[str] | None = Form(default=None),
-    branch_id: str | None = Form(default=None),
+    branch_ids: list[str] = Form(default=[]),
     branch_name: str | None = Form(default=None),
     description: str | None = Form(default=None),
     current_user: SupabaseUser = Depends(require_supabase_user),
-) -> DocumentIngestResponse:
-    # Verify user exists and get org/branch context
-    # For simplicity, we assume the user belongs to the default org or the one implied by branch_id
-    
-    if not branch_id:
-         # Try to find a primary branch for the user
-         # We need an org_id first. Let's try to find the user's org(s).
-         orgs = org_service.list_user_organizations(UUID(current_user.id))
-         if not orgs:
-             raise HTTPException(status_code=403, detail="User is not part of any organization")
-         org_id = orgs[0].id
-         
-         # Get user's branches in this org
-         memberships = org_service.get_user_branch_memberships(UUID(current_user.id), org_id)
-         if memberships:
-             branch_id = str(memberships[0].branch_id)
-         else:
-             raise HTTPException(status_code=400, detail="Branch ID is required and user has no default branch")
-    else:
-        # Verify user access to this branch
-        # We need org_id for the branch to verify membership efficiently or just query branch_members
-        # Let's just assume valid for now or implemented in service
-        pass
+) -> StreamingResponse:
+    """
+    Upload documents and return a streaming response with progress updates (NDJSON).
+    """
+    if not branch_ids:
+         raise HTTPException(status_code=400, detail="At least one branch ID is required")
 
     uploads: list[UploadFile] = []
     if files:
@@ -147,26 +128,17 @@ async def upload_document(
             if normalized:
                 upload.filename = normalized
 
-    # TODO: Get Org ID properly from branch
-    # For now passing None to ingest_uploads, it should be updated to not strictly require it or fetch it
-    
-    try:
-        return await document_ingestor.ingest_uploads(
+    return StreamingResponse(
+        document_ingestor.ingest_uploads_stream(
             uploads,
-            branch_id=branch_id,
+            branch_ids=branch_ids,
             branch_name=branch_name,
-            org_id=None, # metadata_service will handle branch_id
+            org_id=None,
             created_by=current_user.id,
             description=description,
-        )
-    except NoValidDocumentsError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "No valid PDF files were ingested",
-                "failures": [failure.dict() for failure in exc.failures],
-            },
-        ) from exc
+        ),
+        media_type="application/x-ndjson"
+    )
 
 
 @router.get("/list", response_model=DocumentListResponse)
@@ -174,16 +146,12 @@ async def list_documents(
     directory: str | None = Query(
         default=None, description="Filter documents by their directory path"
     ),
-    branch_id: str | None = Query(default=None, description="Filter by branch"),
-    status: str | None = Query(default=None, description="Filter by status (approved, pending_review, rejected)"),
+    branch_id: str | None = Query(default=None, description="Filter by branch context"),
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> DocumentListResponse:
-    # List documents. If branch_id is provided, filter by it.
-    # Else, maybe list all accessible docs?
     
-    raw_documents = metadata_service.list_documents(branch_id=branch_id, status=status)
+    raw_documents = metadata_service.list_documents(branch_id=branch_id)
     
-    # Filter by directory if provided
     directory_filter = normalize_relative_path(directory) if directory else None
     
     documents = []
@@ -201,8 +169,6 @@ async def delete_document(
     relative_path: str = Query(..., description="Relative path of the document to delete"),
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> dict[str, Any]:
-    # Permission check should go here
-    
     try:
         vectors_removed = await run_in_threadpool(
             vector_service.remove_documents,
@@ -225,13 +191,40 @@ async def delete_document(
         "local_deleted": local_deleted,
     }
 
+@router.get("/download")
+async def download_document(
+    relative_path: str = Query(..., description="Relative path of the document to download"),
+    current_user: SupabaseUser = Depends(require_supabase_user),
+):
+    try:
+        download_source, content_type = storage_service.get_download_info(relative_path)
+
+        if isinstance(download_source, Path):
+            # Local file
+            return FileResponse(
+                download_source,
+                media_type=content_type,
+                filename=Path(relative_path).name, # Use original filename
+            )
+        elif isinstance(download_source, str):
+            # Supabase signed URL
+            return RedirectResponse(url=download_source, status_code=303)
+        else:
+            raise HTTPException(status_code=500, detail="Unexpected download source type")
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Error downloading document %s: %s", relative_path, exc)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
 @router.post("/search", response_model=DocumentSearchResponse)
 async def search_documents(
     request: DocumentSearchRequest,
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> DocumentSearchResponse:
-    # Basic search implementation
     raw_documents = metadata_service.list_documents()
     query_lower = request.query.lower()
     matching_documents = []
@@ -249,51 +242,12 @@ async def search_documents(
     )
 
 
-@router.patch("/{document_id}/review", response_model=dict[str, Any])
-async def review_document(
-    document_id: UUID,
-    review: DocumentReviewRequest,
-    current_user: SupabaseUser = Depends(require_supabase_user),
-) -> dict[str, Any]:
-    # Check if user has permission to review (Admin/Owner)
-    orgs = org_service.list_user_organizations(UUID(current_user.id))
-    if not orgs:
-        raise HTTPException(status_code=403, detail="User is not part of any organization")
-    org_id = orgs[0].id
-
-    roles = org_service.get_user_roles(UUID(current_user.id), org_id)
-    is_authorized = False
-    for role in roles:
-        if role.name in ["OrgOwner", "Admin", "BranchManager"]:
-            is_authorized = True
-            break
-    
-    if not is_authorized:
-        raise HTTPException(status_code=403, detail="Insufficient permissions to review documents")
-
-    if review.document_id != document_id:
-        raise HTTPException(status_code=400, detail="Document ID mismatch")
-
-    success = metadata_service.update_document_status(
-        str(document_id), 
-        review.status,
-        reviewed_by=current_user.id
-    )
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to update document status")
-
-    return {"id": str(document_id), "status": review.status}
-
-
 @router.get("/permissions", response_model=dict[str, Any])
 async def get_my_document_permissions(
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> dict[str, Any]:
-    # Determine org context
     orgs = org_service.list_user_organizations(UUID(current_user.id))
     if not orgs:
-        # If no org, default to empty/limited
-        # Or use default org if configured
         if settings.default_org_id:
              org_id = UUID(settings.default_org_id)
         else:
@@ -304,20 +258,14 @@ async def get_my_document_permissions(
                 "document_permissions": {}
              }
     else:
-        org_id = orgs[0].id # User's first org
+        org_id = orgs[0].id
 
-    # Check roles
     roles = org_service.get_user_roles(UUID(current_user.id), org_id)
     role_names = {r.name for r in roles}
     
     is_superadmin = "OrgOwner" in role_names
-    # Branch Manager or Admin typically has full access to their scope.
-    # For simplicity, we treat them as having "full access" flag for UI, 
-    # but backend might still enforce branch scoping elsewhere.
     is_admin_or_manager = is_superadmin or "Admin" in role_names or "BranchManager" in role_names
     
-    # Calculate permissions
-    # If superadmin, we can skip detailed calculation or return empty dict + full_access flag
     perms = {}
     if not is_superadmin:
         perms = org_service.get_user_permissions_summary(UUID(current_user.id), org_id)
@@ -325,7 +273,6 @@ async def get_my_document_permissions(
     return {
         "is_superadmin": is_superadmin,
         "has_full_access": is_admin_or_manager,
-        # Simple heuristic: if they have upload perm on any folder or are admin
         "can_upload_role": is_admin_or_manager or any(p.get("can_upload") for p in perms.values()),
         "document_permissions": perms
     }

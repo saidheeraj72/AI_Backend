@@ -6,9 +6,10 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field
 
-from src.api.dependencies.auth import require_supabase_user, SupabaseUser
+from src.api.dependencies.auth import require_supabase_user, SupabaseUser, bearer_scheme
 from src.core.config import get_settings
 from src.services.organization_service import OrganizationService
 from src.models.schemas import (
@@ -96,15 +97,19 @@ class TeamProfileCreateRequest(BaseModel):
 
 # ==================== Helper Functions ====================
 
-def _build_supabase_headers() -> dict[str, str]:
+def _build_supabase_headers(token: Optional[str] = None) -> dict[str, str]:
     settings = get_settings()
     api_key = settings.supabase_anon_key or settings.supabase_key
-    return {
+    headers = {
         "apikey": api_key,
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation" 
+        "Prefer": "return=representation"
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 async def _supabase_request(
     method: str, url: str, headers: dict[str, str], json: Optional[dict[str, Any]] = None
@@ -176,13 +181,14 @@ def _map_db_to_response(db_profile: dict) -> TeamProfileResponse:
 async def get_team_profiles(
     is_active: Optional[bool] = None,
     user: SupabaseUser = Depends(require_supabase_user),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> list[TeamProfileResponse]:
     settings = get_settings()
-    headers = _build_supabase_headers()
+    headers = _build_supabase_headers(token=credentials.credentials)
 
     # We need to join with profiles table to get name/email
-    # select=*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles(full_name,email,avatar_url)
-    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles(full_name,email,avatar_url)"
+    # select=*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)
+    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)"
     
     url = f"{settings.supabase_url}/rest/v1/team_profiles?select={query}"
     if is_active is not None:
@@ -190,31 +196,45 @@ async def get_team_profiles(
 
     data = await _supabase_request("GET", url, headers)
     
+    if not isinstance(data, list):
+        logger.error(f"Unexpected response from Supabase (expected list): {data}")
+        return []
+
     # Flatten the 'profiles' join
     for item in data:
+        if not isinstance(item, dict):
+            continue
+
         if item.get("profiles"):
             item["full_name"] = item["profiles"].get("full_name")
             item["email"] = item["profiles"].get("email")
             item["avatar_url"] = item["profiles"].get("avatar_url")
     
-    return [_map_db_to_response(item) for item in data]
+    return [_map_db_to_response(item) for item in data if isinstance(item, dict)]
 
 @router.get("/{profile_id}", response_model=TeamProfileResponse)
 async def get_team_profile(
     profile_id: str,
     user: SupabaseUser = Depends(require_supabase_user),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> TeamProfileResponse:
     settings = get_settings()
-    headers = _build_supabase_headers()
+    headers = _build_supabase_headers(token=credentials.credentials)
 
-    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles(full_name,email,avatar_url)"
+    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)"
     url = f"{settings.supabase_url}/rest/v1/team_profiles?id=eq.{profile_id}&select={query}"
 
     data = await _supabase_request("GET", url, headers)
-    if not data:
+    
+    if not isinstance(data, list) or not data:
+        if isinstance(data, dict):
+            logger.error(f"Unexpected response in get_team_profile: {data}")
         raise HTTPException(status_code=404, detail="Profile not found")
     
     item = data[0]
+    if not isinstance(item, dict):
+        raise HTTPException(status_code=500, detail="Invalid profile data format")
+
     if item.get("profiles"):
         item["full_name"] = item["profiles"].get("full_name")
         item["email"] = item["profiles"].get("email")
@@ -225,9 +245,10 @@ async def get_team_profile(
 async def create_team_profile(
     request: TeamProfileCreateRequest,
     user: SupabaseUser = Depends(require_supabase_user),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> TeamProfileResponse:
     settings = get_settings()
-    headers = _build_supabase_headers()
+    headers = _build_supabase_headers(token=credentials.credentials)
     
     # Resolve Organization ID
     org_id = settings.default_org_id
@@ -273,7 +294,9 @@ async def create_team_profile(
     
     url = f"{settings.supabase_url}/rest/v1/team_profiles"
     created = await _supabase_request("POST", url, headers, json=payload)
-    if not created:
+    
+    if not isinstance(created, list) or not created or not isinstance(created[0], dict):
+         logger.error(f"Failed to create profile, response: {created}")
          raise HTTPException(status_code=400, detail="Failed to create profile")
     
     pid = created[0]["id"]
@@ -301,4 +324,4 @@ async def create_team_profile(
              })
         await _supabase_request("POST", f"{settings.supabase_url}/rest/v1/team_experience", headers, json=e_data)
 
-    return await get_team_profile(pid, user)
+    return await get_team_profile(pid, user, credentials)

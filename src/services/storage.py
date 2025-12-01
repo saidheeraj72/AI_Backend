@@ -217,6 +217,48 @@ class StorageService:
 
         return removed_local
 
+    def get_download_info(self, relative_path: str) -> tuple[Path | str, str]:
+        path_obj = Path(relative_path)
+        target_path = (self.base_dir / path_obj).resolve()
+        try:
+            target_path.relative_to(self.base_dir)
+        except ValueError:
+            raise ValueError("Attempted to access a path outside the storage directory")
+
+        # Determine content type (simple guess based on extension)
+        content_type = "application/octet-stream"
+        if target_path.suffix.lower() == ".pdf":
+            content_type = "application/pdf"
+        elif target_path.suffix.lower() in [".jpg", ".jpeg"]:
+            content_type = "image/jpeg"
+        elif target_path.suffix.lower() == ".png":
+            content_type = "image/png"
+        # Add more content types as needed
+
+        if self._supabase_enabled:
+            try:
+                # Generate a signed URL for Supabase
+                assert self._supabase_client is not None
+                bucket = self._supabase_client.storage.from_(self._supabase_bucket)
+                signed_url_response = bucket.create_signed_url(
+                    path_obj.as_posix(),
+                    3600  # URL valid for 1 hour
+                )
+                return signed_url_response["signedURL"], content_type
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to generate Supabase signed URL for %s: %s; falling back to local file path",
+                    relative_path, exc
+                )
+                # Fallback to local if Supabase fails
+                if not target_path.exists():
+                    raise FileNotFoundError(f"File not found locally: {relative_path}")
+                return target_path, content_type
+        else:
+            if not target_path.exists():
+                raise FileNotFoundError(f"File not found locally: {relative_path}")
+            return target_path, content_type
+
     def cleanup_local_path(self, local_path: Path, *, allow_dir_cleanup: bool = False) -> None:
         """Delete a temporary local file created during ingestion."""
         if not local_path.exists():

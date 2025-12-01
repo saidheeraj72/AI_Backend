@@ -11,7 +11,7 @@ from supabase import Client, create_client
 
 class MetadataService:
     """
-    Manages documents and folders in Supabase using the new schema.
+    Manages documents and folders in Supabase using the new schema (Many-to-Many).
     """
 
     def __init__(
@@ -29,7 +29,6 @@ class MetadataService:
         self._supabase_client: Optional[Client] = None
         self._supabase_table = supabase_table
         
-        # We might need default branch_id instead of org_id now, but let's keep this for fallback or config
         self._default_org_id = (default_org_id or "").strip() or None
 
         if supabase_url and supabase_key:
@@ -43,10 +42,13 @@ class MetadataService:
             raise RuntimeError("Supabase client not configured")
         return self._supabase_client
 
-    def _get_folder_id_by_path(self, branch_id: str, path: str, create: bool = False, created_by: Optional[str] = None) -> Optional[str]:
+    def _get_folder_id_by_path(self, branch_ids: List[str], path: str, create: bool = False, created_by: Optional[str] = None) -> Optional[str]:
         """
-        Resolves a folder path (e.g., "finance/reports") to a folder_id for a given branch.
-        If create is True, creates missing folders.
+        Resolves a folder path (e.g., "finance/reports") to a SINGLE folder_id shared by the given branches.
+        Strategy:
+        1. For each level, look for an existing folder (name, parent) linked to ANY of the branch_ids.
+        2. If found, use it and ensure it's linked to ALL branch_ids.
+        3. If not found, create it and link to ALL branch_ids.
         """
         client = self._require_client()
         
@@ -60,30 +62,64 @@ class MetadataService:
             if not folder_name:
                 continue
             
-            query = client.table("folders").select("id").eq("branch_id", branch_id).eq("name", folder_name)
+            # 1. Try to find existing folder in ANY of the branches
+            # We need to query folders that match name, parent, AND exist in folder_branches for these branches.
+            # This is complex in one query. Let's try to find by name/parent first, then filter?
+            # Or better: Find ANY folder with this name/parent that is linked to one of our branches.
+            
+            # Step A: Get candidates by name/parent
+            query = client.table("folders").select("id, folder_branches!inner(branch_id)").eq("name", folder_name)
             if current_parent_id:
                 query = query.eq("parent_id", current_parent_id)
             else:
                 query = query.is_("parent_id", "null")
             
-            response = query.maybe_single().execute()
+            # Filter by branches in the inner join if possible, or post-filter
+            # supabase-py 'in' filter on foreign table might be tricky.
+            # Let's fetch candidates and pick one that matches our branches.
+            response = query.execute()
+            candidates = response.data or []
             
-            if response and response.data:
-                current_parent_id = response.data["id"]
-            elif create:
-                payload = {
-                    "branch_id": branch_id,
-                    "name": folder_name,
-                    "parent_id": current_parent_id,
-                    "created_by": created_by
-                }
-                new_folder = client.table("folders").insert(payload).execute()
-                if new_folder.data:
-                    current_parent_id = new_folder.data[0]["id"]
+            chosen_folder_id = None
+            
+            # Filter candidates to see if any belong to our requested branch_ids
+            for cand in candidates:
+                # cand['folder_branches'] is a list of dicts due to !inner
+                linked_branches = {b['branch_id'] for b in cand.get('folder_branches', [])}
+                if any(bid in linked_branches for bid in branch_ids):
+                    chosen_folder_id = cand['id']
+                    break
+            
+            # Step B: If no suitable folder found, and create=True, make one.
+            if not chosen_folder_id:
+                if create:
+                    payload = {
+                        "name": folder_name,
+                        "parent_id": current_parent_id,
+                        "created_by": created_by,
+                        "description": "Created via upload"
+                    }
+                    new_folder = client.table("folders").insert(payload).execute()
+                    if new_folder.data:
+                        chosen_folder_id = new_folder.data[0]["id"]
+                    else:
+                        return None
                 else:
-                    return None # Failed to create
-            else:
-                return None
+                    return None
+            
+            # Step C: Ensure chosen_folder_id is linked to ALL requested branch_ids
+            if chosen_folder_id:
+                links_to_create = []
+                for bid in branch_ids:
+                    links_to_create.append({"folder_id": chosen_folder_id, "branch_id": bid})
+                
+                if links_to_create:
+                    # Upserting into folder_branches (ignoring duplicates)
+                    # Supabase upsert requires primary key or unique constraint. 
+                    # We have unique(folder_id, branch_id).
+                    client.table("folder_branches").upsert(links_to_create, on_conflict="folder_id, branch_id", ignore_duplicates=True).execute()
+            
+            current_parent_id = chosen_folder_id
                 
         return current_parent_id
 
@@ -91,20 +127,20 @@ class MetadataService:
         self,
         relative_path: Path,
         chunks_indexed: int,
-        branch_id: Optional[str] = None,
-        branch_name: Optional[str] = None,
+        branch_ids: List[str],
+        branch_name: Optional[str] = None, # Legacy/informative
         *,
         org_id: Optional[str] = None,
         created_by: Optional[str] = None,
         description: Optional[str] = None,
-        status: str = "pending_review",
+        # status param removed
     ) -> None:
         if not self._supabase_client:
              self.logger.warning("Supabase not configured, skipping DB record")
              return
 
-        if not branch_id:
-            self.logger.error("branch_id is required for recording documents in new schema")
+        if not branch_ids:
+            self.logger.error("branch_ids list is required for recording documents")
             return
 
         title = relative_path.name
@@ -113,59 +149,65 @@ class MetadataService:
         if directory_path == ".":
             directory_path = ""
 
-        # Resolve folder_id
-        folder_id = self._get_folder_id_by_path(branch_id, directory_path, create=True, created_by=created_by)
+        # Resolve folder_id (ensuring it exists and is linked to all branches)
+        folder_id = self._get_folder_id_by_path(branch_ids, directory_path, create=True, created_by=created_by)
 
+        # 1. Upsert Document (Global)
         payload = {
-            "branch_id": branch_id,
             "folder_id": folder_id,
             "owner_id": created_by,
             "title": title,
             "storage_path": storage_path,
             "description": description,
-            "status": status,
             "metadata": {
                 "chunks_indexed": chunks_indexed,
-                "branch_name": branch_name
+                "branch_names": branch_name # Just for ref
             }
         }
 
         try:
-            # We use storage_path as unique constraint or just insert
-            # The schema doesn't strictly enforce unique storage_path per branch but it's good practice.
-            # Let's check if it exists first to update or insert (Upsert)
-            # We need a unique key for upsert. The schema allows duplicate storage paths technically unless unique index added.
-            # But let's assume we want to update if exists.
+            # Upsert document by storage_path (assuming unique path per file system)
+            # Use select first to get ID if exists
+            existing = self._supabase_client.table("documents").select("id").eq("storage_path", storage_path).maybe_single().execute()
             
-            # Find existing by branch_id and storage_path
-            existing = self._supabase_client.table("documents").select("id").eq("branch_id", branch_id).eq("storage_path", storage_path).maybe_single().execute()
-            
+            doc_id = None
             if existing and existing.data:
-                self._supabase_client.table("documents").update(payload).eq("id", existing.data["id"]).execute()
+                doc_id = existing.data["id"]
+                self._supabase_client.table("documents").update(payload).eq("id", doc_id).execute()
             else:
-                self._supabase_client.table("documents").insert(payload).execute()
+                res = self._supabase_client.table("documents").insert(payload).execute()
+                if res.data:
+                    doc_id = res.data[0]["id"]
+
+            if doc_id:
+                # 2. Link to Branches
+                links = [{"document_id": doc_id, "branch_id": bid} for bid in branch_ids]
+                self._supabase_client.table("document_branches").upsert(links, on_conflict="document_id, branch_id", ignore_duplicates=True).execute()
                 
-            self.logger.info("Recorded metadata for %s in Supabase", storage_path)
+                self.logger.info("Recorded metadata for %s in Supabase (Branches: %s)", storage_path, branch_ids)
         except Exception as exc:
             self.logger.error("Failed to upsert Supabase metadata for %s: %s", storage_path, exc)
 
     def list_documents(self, *, org_id: Optional[str] = None, branch_id: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Lists documents.
+        If branch_id is provided, filters by availability in that branch.
+        """
         if not self._supabase_client:
             return []
             
         try:
-            # Join with profiles to get owner email and reviewer email using aliases
-            # Note: We assume 'owner_id' and 'reviewed_by' are the foreign keys to 'profiles'
+            # Select documents, join with folder and owner
+            # Also filter by document_branches if branch_id set
             query = self._supabase_client.table("documents").select(
-                "id, title, storage_path, branch_id, description, status, metadata, folders(name), "
+                "id, title, storage_path, description, metadata, folders(name), "
                 "owner:profiles!owner_id(email), "
-                "reviewer:profiles!reviewed_by(email), "
-                "reviewed_at"
+                "document_branches!inner(branch_id)" # Inner join to filter
             )
+            
             if branch_id:
-                query = query.eq("branch_id", branch_id)
-            if status:
-                query = query.eq("status", status)
+                # Filter the INNER JOINED table
+                query = query.eq("document_branches.branch_id", branch_id)
             
             response = query.order("storage_path").execute()
             
@@ -175,7 +217,9 @@ class MetadataService:
                 storage_path = record.get("storage_path")
                 metadata = record.get("metadata") or {}
                 owner_profile = record.get("owner") or {}
-                reviewer_profile = record.get("reviewer") or {}
+                
+                # Flatten branches if needed, or just show "visible"
+                # record['document_branches'] will contain the matching branch(es)
                 
                 items.append({
                     "id": record.get("id"),
@@ -183,33 +227,14 @@ class MetadataService:
                     "relative_path": storage_path,
                     "directory": record.get("folders", {}).get("name") if record.get("folders") else "",
                     "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
-                    "branch_id": record.get("branch_id"),
-                    "branch_name": (metadata or {}).get("branch_name"),
+                    # "branch_id": branch_id, # Context
                     "description": record.get("description"),
-                    "status": record.get("status", "pending_review"),
                     "owner_email": owner_profile.get("email") if owner_profile else None,
-                    "reviewer_email": reviewer_profile.get("email") if reviewer_profile else None,
-                    "reviewed_at": record.get("reviewed_at"),
                 })
             return items
         except Exception as exc:
             self.logger.error("Failed to list documents: %s", exc)
             return []
-
-    def update_document_status(self, document_id: str, status: str, reviewed_by: Optional[str] = None) -> bool:
-        if not self._supabase_client:
-            return False
-        try:
-            payload = {"status": status}
-            if reviewed_by:
-                payload["reviewed_by"] = reviewed_by
-                payload["reviewed_at"] = "now()" # Let Postgres handle timestamp or import datetime
-            
-            self._supabase_client.table("documents").update(payload).eq("id", document_id).execute()
-            return True
-        except Exception as exc:
-            self.logger.error("Failed to update document status: %s", exc)
-            return False
 
     def get_document_by_id(self, document_id: str, *, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not self._supabase_client:
@@ -223,7 +248,6 @@ class MetadataService:
                     "id": record.get("id"),
                     "relative_path": record.get("storage_path"),
                     "filename": record.get("title"),
-                    "branch_id": record.get("branch_id"),
                     "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
                 }
         except Exception as exc:
@@ -234,20 +258,22 @@ class MetadataService:
         if not self._supabase_client:
             return False
         try:
-            # Again, risky without branch_id. RLS should protect cross-tenant deletes.
             self._supabase_client.table("documents").delete().eq("storage_path", relative_path).execute()
             return True
         except Exception as exc:
             self.logger.error("Failed to delete document: %s", exc)
             return False
 
-    def create_folder(self, branch_id: str, name: str, parent_id: Optional[str] = None, description: Optional[str] = None, created_by: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def create_folder(self, branch_ids: List[str], name: str, parent_id: Optional[str] = None, description: Optional[str] = None, created_by: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Explicitly creates a folder and links it to the provided branch_ids.
+        """
         if not self._supabase_client:
             return None
         
         try:
+            # 1. Create Folder (Global)
             payload = {
-                "branch_id": branch_id,
                 "name": name,
                 "parent_id": parent_id,
                 "description": description,
@@ -256,7 +282,15 @@ class MetadataService:
             
             response = self._supabase_client.table("folders").insert(payload).execute()
             if response.data:
-                return response.data[0]
+                folder_data = response.data[0]
+                folder_id = folder_data["id"]
+                
+                # 2. Link to Branches
+                if branch_ids:
+                    links = [{"folder_id": folder_id, "branch_id": bid} for bid in branch_ids]
+                    self._supabase_client.table("folder_branches").upsert(links, on_conflict="folder_id, branch_id", ignore_duplicates=True).execute()
+                
+                return folder_data
         except Exception as exc:
             self.logger.error("Failed to create folder: %s", exc)
         return None

@@ -178,7 +178,8 @@ class TeamProfile(TeamProfileBase):
 
 class Folder(BaseModel):
     id: UUID
-    branch_id: UUID
+    # branch_id removed, folders are now many-to-many. 
+    # We might include a list of branch_ids if needed, but for basic "Folder" object it's just the entity.
     parent_id: Optional[UUID] = None
     name: str
     description: Optional[str] = None
@@ -190,19 +191,19 @@ class Folder(BaseModel):
         from_attributes = True
 
 class FolderCreate(BaseModel):
-    branch_id: UUID
+    branch_ids: List[UUID]
     parent_id: Optional[UUID] = None
     name: str
     description: Optional[str] = None
 
 class Document(BaseModel):
     id: UUID
-    branch_id: UUID
+    # branch_id removed
     folder_id: Optional[UUID] = None
     owner_id: Optional[UUID] = None
     title: str
     description: Optional[str] = None
-    status: str = "pending_review"
+    # status removed
     storage_path: str
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
@@ -259,10 +260,8 @@ class DocumentUploadResult(BaseModel):
     directory: str
     chunks_indexed: int
     message: str
-    branch_id: Optional[UUID] = None
-    branch_name: Optional[str] = None
+    branch_ids: Optional[List[UUID]] = None
     description: Optional[str] = None
-    status: str = "pending_review"
 
 
 class DocumentUploadError(BaseModel):
@@ -276,18 +275,11 @@ class DocumentListItem(BaseModel):
     relative_path: str
     directory: str
     chunks_indexed: int
-    branch_id: Optional[UUID] = None
-    branch_name: Optional[str] = None
+    # If listing for a specific branch context, we can include it.
+    # If listing all, maybe list of branches? 
+    # For now, let's keep it simple.
     description: Optional[str] = None
-    status: str = "pending_review"
     owner_email: Optional[str] = None
-    reviewer_email: Optional[str] = None
-    reviewed_at: Optional[datetime] = None
-
-
-class DocumentReviewRequest(BaseModel):
-    document_id: UUID
-    status: str = Field(..., pattern="^(approved|rejected)$")
 
 
 class DocumentListResponse(BaseModel):
