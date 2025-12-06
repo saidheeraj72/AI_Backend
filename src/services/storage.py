@@ -163,11 +163,12 @@ class StorageService:
         for part in candidate.parts:
             if part in {"", ".", ".."}:
                 continue
-            safe_part = re.sub(r"[^a-zA-Z0-9._-]", "_", part) or "_"
+            # Allow alphanumeric, dot, underscore, hyphen, and space
+            safe_part = re.sub(r"[^a-zA-Z0-9._ -]", "_", part) or "_"
             parts.append(safe_part)
 
         if not parts:
-            fallback_stem = re.sub(r"[^a-zA-Z0-9._-]", "_", Path(fallback_name).stem) or "document"
+            fallback_stem = re.sub(r"[^a-zA-Z0-9._ -]", "_", Path(fallback_name).stem) or "document"
             parts = [f"{fallback_stem}.pdf"]
 
         relative = Path(*parts)

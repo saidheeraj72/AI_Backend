@@ -227,12 +227,20 @@ async def search_documents(
 ) -> DocumentSearchResponse:
     raw_documents = metadata_service.list_documents()
     query_lower = request.query.lower()
+    # Check for underscore version too (e.g. "foo bar" matches "foo_bar")
+    query_normalized = query_lower.replace(" ", "_")
+    
     matching_documents = []
 
     for record in raw_documents:
+        filename = str(record.get("filename", "")).lower()
+        rel_path = str(record.get("relative_path", "")).lower()
+        
         if (
-            query_lower in str(record.get("filename", "")).lower()
-            or query_lower in str(record.get("relative_path", "")).lower()
+            query_lower in filename
+            or query_lower in rel_path
+            or query_normalized in filename
+            or query_normalized in rel_path
         ):
             matching_documents.append(DocumentListItem(**record))
 

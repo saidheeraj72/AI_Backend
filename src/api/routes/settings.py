@@ -313,6 +313,28 @@ async def delete_role(
     org_service.delete_role(UUID(role_id), ctx["org_id"])
     return {"message": "Role deleted"}
 
+@router.put("/roles/{role_id}", response_model=dict[str, Any])
+async def update_role(
+    role_id: str,
+    payload: dict[str, Any],
+    current_user: SupabaseUser = Depends(require_supabase_user)
+) -> dict[str, Any]:
+    ctx = _get_user_context(current_user.id)
+    if not ctx["is_admin"]:
+        raise HTTPException(status_code=403, detail="Only Admins can manage roles")
+        
+    name = payload.get("name")
+    permissions = payload.get("permissions", {})
+    
+    if not name:
+        raise HTTPException(status_code=400, detail="Role name required")
+
+    role = org_service.update_role(UUID(role_id), ctx["org_id"], name, permissions)
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+        
+    return {"role_id": str(role.id), "message": "Role updated"}
+
 @router.post("/branches", response_model=dict[str, Any])
 async def create_branch(
     payload: dict[str, Any],
@@ -329,3 +351,27 @@ async def create_branch(
     
     branch = org_service.create_branch(ctx["org_id"], name, code, location, timezone)
     return {"branch_id": str(branch.id), "message": "Branch created"}
+
+@router.put("/branches/{branch_id}", response_model=dict[str, Any])
+async def update_branch(
+    branch_id: str,
+    payload: dict[str, Any],
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, Any]:
+    ctx = _get_user_context(current_user.id)
+    if not ctx["is_admin"]:
+        raise HTTPException(status_code=403, detail="Only Admins can update branches")
+        
+    name = payload.get("name")
+    code = payload.get("code", name[:3].upper() if name else "")
+    location = payload.get("location", "Unknown")
+    timezone = payload.get("timezone", "UTC")
+    
+    if not name:
+         raise HTTPException(status_code=400, detail="Branch name required")
+    
+    branch = org_service.update_branch(UUID(branch_id), ctx["org_id"], name, code, location, timezone)
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branch not found")
+        
+    return {"branch_id": str(branch.id), "message": "Branch updated"}

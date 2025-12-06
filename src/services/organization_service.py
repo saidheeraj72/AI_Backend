@@ -212,7 +212,30 @@ class OrganizationService:
         # Only allow deleting roles belonging to this org (and not system roles ideally, handled by RLS or check)
         client.table("roles").delete().eq("id", str(role_id)).eq("organization_id", str(org_id)).execute()
 
-
+    def update_role(self, role_id: UUID, org_id: UUID, name: str, permissions: Dict[str, bool]) -> Optional[Role]:
+        client = self._require_client()
+        payload = {
+            "name": name,
+            "permissions": permissions
+        }
+        response = client.table("roles").update(payload).eq("id", str(role_id)).eq("organization_id", str(org_id)).execute()
+        if response.data:
+            return Role(**response.data[0])
+        return None
+    
+    def update_branch(self, branch_id: UUID, org_id: UUID, name: str, code: str, location: str, timezone: str) -> Optional[Branch]:
+        client = self._require_client()
+        payload = {
+            "name": name,
+            "code": code,
+            "location": location,
+            "timezone": timezone
+        }
+        response = client.table("branches").update(payload).eq("id", str(branch_id)).eq("organization_id", str(org_id)).execute()
+        if response.data:
+            return Branch(**response.data[0])
+        return None
+        
     def list_group_members(self, org_id: UUID) -> List[dict]:
         client = self._require_client()
         # Get all groups in org
