@@ -200,7 +200,7 @@ class MetadataService:
             # Select documents, join with folder and owner
             # Also filter by document_branches if branch_id set
             query = self._supabase_client.table("documents").select(
-                "id, title, storage_path, description, metadata, folders(name), "
+                "id, title, storage_path, description, metadata, created_at, folders(name), "
                 "owner:profiles!owner_id(email), "
                 "document_branches!inner(branch_id)" # Inner join to filter
             )
@@ -227,6 +227,7 @@ class MetadataService:
                     "relative_path": storage_path,
                     "directory": record.get("folders", {}).get("name") if record.get("folders") else "",
                     "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
+                    "created_at": record.get("created_at"),
                     # "branch_id": branch_id, # Context
                     "description": record.get("description"),
                     "owner_email": owner_profile.get("email") if owner_profile else None,

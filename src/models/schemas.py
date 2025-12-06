@@ -275,6 +275,7 @@ class DocumentListItem(BaseModel):
     relative_path: str
     directory: str
     chunks_indexed: int
+    created_at: Optional[datetime] = None
     # If listing for a specific branch context, we can include it.
     # If listing all, maybe list of branches? 
     # For now, let's keep it simple.
