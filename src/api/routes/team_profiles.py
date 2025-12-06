@@ -1,70 +1,75 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, List
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, Field
 
-from src.api.dependencies.auth import require_supabase_user, SupabaseUser
+from src.api.dependencies.auth import require_supabase_user, SupabaseUser, bearer_scheme
 from src.core.config import get_settings
+from src.services.organization_service import OrganizationService
+from src.models.schemas import (
+    TeamProfile as DbTeamProfile,
+    TeamSkill,
+    TeamQualification,
+    TeamExperience
+)
 
 router = APIRouter(prefix="/team-profiles", tags=["team-profiles"])
 logger = logging.getLogger(__name__)
 
-
-# ==================== Pydantic Models ====================
+# --- Frontend-Compatible Models ---
 
 class BillingInfo(BaseModel):
     ratePerHour: float
     currency: str = "AUD"
 
-
 class DailyTimings(BaseModel):
-    from_time: str = "09:00"
-    to_time: str = "17:00"
+    from_time: str = Field(..., alias="from")
+    to_time: str = Field(..., alias="to")
 
     class Config:
-        # Allow using 'from' as field name
-        fields = {'from_time': 'from', 'to_time': 'to'}
+        populate_by_name = True
 
-
-class Experience(BaseModel):
-    years: int
+class ExperienceItem(BaseModel):
+    years: float
     role: str
     company: str
-    description: str
-
+    description: Optional[str] = None
 
 class TeamProfileResponse(BaseModel):
     id: str
-    name: str
-    title: str
-    email: str
+    name: Optional[str] = None # In Profile, but we might need to fetch it
+    title: Optional[str] = Field(None, alias="job_title") # Map job_title to title
+    email: Optional[str] = None
     employeeCode: Optional[str] = None
     profilePhoto: Optional[str] = None
-    department: str
+    department: Optional[str] = None
     reportingManager: Optional[str] = None
-    branch: Optional[str] = None
-    location: Optional[str] = None
+    branch: Optional[str] = None # We have branch_id, need name?
+    location: Optional[str] = None # Derived from branch?
     timezone: Optional[str] = None
     billing: BillingInfo
-    weeklyHours: int = 40
+    weeklyHours: float = 40
     dailyTimings: DailyTimings
     overtimeAllowed: bool = False
     employmentStartDate: Optional[str] = None
     employmentEndDate: Optional[str] = None
     profileSummary: Optional[str] = None
-    qualifications: list[str] = []
-    skillsAndExpertise: list[str] = []
-    experience: list[Experience] = []
+    qualifications: List[str] = []
+    skillsAndExpertise: List[str] = []
+    experience: List[ExperienceItem] = []
     isActive: bool = True
     status: str = "Active"
 
+    class Config:
+        populate_by_name = True
 
-class TeamProfileCreate(BaseModel):
+class TeamProfileCreateRequest(BaseModel):
     name: str
     title: str
     email: EmailStr
@@ -80,70 +85,37 @@ class TeamProfileCreate(BaseModel):
     employmentEndDate: Optional[str] = None
     billingRatePerHour: float
     billingCurrency: str = "AUD"
-    weeklyHours: int = 40
+    weeklyHours: float = 40
     dailyTimingsFrom: str = "09:00"
     dailyTimingsTo: str = "17:00"
     profileSummary: Optional[str] = None
     qualifications: list[str] = []
     skillsAndExpertise: list[str] = []
-    experience: list[Experience] = []
+    experience: list[dict] = []
     isActive: bool = True
-
-
-class TeamProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    title: Optional[str] = None
-    email: Optional[EmailStr] = None
-    employeeCode: Optional[str] = None
-    profilePhoto: Optional[str] = None
-    department: Optional[str] = None
-    reportingManager: Optional[str] = None
-    branch: Optional[str] = None
-    location: Optional[str] = None
-    timezone: Optional[str] = None
-    overtimeAllowed: Optional[bool] = None
-    employmentStartDate: Optional[str] = None
-    employmentEndDate: Optional[str] = None
-    billingRatePerHour: Optional[float] = None
-    billingCurrency: Optional[str] = None
-    weeklyHours: Optional[int] = None
-    dailyTimingsFrom: Optional[str] = None
-    dailyTimingsTo: Optional[str] = None
-    profileSummary: Optional[str] = None
-    qualifications: Optional[list[str]] = None
-    skillsAndExpertise: Optional[list[str]] = None
-    experience: Optional[list[Experience]] = None
-    isActive: Optional[bool] = None
 
 
 # ==================== Helper Functions ====================
 
-def _build_supabase_headers() -> dict[str, str]:
-    """Build headers for Supabase requests."""
+def _build_supabase_headers(token: Optional[str] = None) -> dict[str, str]:
     settings = get_settings()
     api_key = settings.supabase_anon_key or settings.supabase_key
-    return {
+    headers = {
         "apikey": api_key,
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Prefer": "return=representation"
     }
-
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 async def _supabase_request(
     method: str, url: str, headers: dict[str, str], json: Optional[dict[str, Any]] = None
-) -> dict[str, Any]:
-    """Make a request to Supabase."""
+) -> Any:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        if method.upper() == "GET":
-            response = await client.get(url, headers=headers)
-        elif method.upper() == "POST":
-            response = await client.post(url, headers=headers, json=json)
-        elif method.upper() == "PATCH":
-            response = await client.patch(url, headers=headers, json=json)
-        elif method.upper() == "DELETE":
-            response = await client.delete(url, headers=headers)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
+        response = await client.request(method, url, headers=headers, json=json)
 
     if response.status_code >= 400:
         logger.error(f"Supabase request failed: {response.status_code} - {response.text}")
@@ -157,41 +129,51 @@ async def _supabase_request(
     except ValueError:
         return {}
 
+def _map_db_to_response(db_profile: dict) -> TeamProfileResponse:
+    # Map snake_case DB fields to camelCase frontend model
+    
+    skills = [s["skill_name"] for s in db_profile.get("skills", [])]
+    quals = [q["degree"] for q in db_profile.get("qualifications", [])]
+    exps = [
+        ExperienceItem(
+            years=e.get("years_duration", 0),
+            role=e.get("role", ""),
+            company=e.get("company", ""),
+            description=e.get("description", "")
+        ) 
+        for e in db_profile.get("experience", [])
+    ]
 
-def _transform_db_to_response(db_profile: dict[str, Any]) -> dict[str, Any]:
-    """Transform database profile to API response format."""
-    return {
-        "id": db_profile["id"],
-        "name": db_profile["name"],
-        "title": db_profile["title"],
-        "email": db_profile["email"],
-        "employeeCode": db_profile.get("employee_code"),
-        "profilePhoto": db_profile.get("profile_photo"),
-        "department": db_profile["department"],
-        "reportingManager": db_profile.get("reporting_manager"),
-        "branch": db_profile.get("branch"),
-        "location": db_profile.get("location"),
-        "timezone": db_profile.get("timezone"),
-        "billing": {
-            "ratePerHour": float(db_profile.get("billing_rate_per_hour", 0)),
-            "currency": db_profile.get("billing_currency", "AUD"),
-        },
-        "weeklyHours": db_profile.get("weekly_hours", 40),
-        "dailyTimings": {
-            "from": db_profile.get("daily_timings_from", "09:00:00")[:5],
-            "to": db_profile.get("daily_timings_to", "17:00:00")[:5],
-        },
-        "overtimeAllowed": db_profile.get("overtime_allowed", False),
-        "employmentStartDate": db_profile.get("employment_start_date"),
-        "employmentEndDate": db_profile.get("employment_end_date"),
-        "profileSummary": db_profile.get("profile_summary"),
-        "qualifications": db_profile.get("qualifications", []),
-        "skillsAndExpertise": db_profile.get("skills", []),
-        "experience": db_profile.get("experience", []),
-        "isActive": db_profile.get("is_active", True),
-        "status": "Active" if db_profile.get("is_active", True) else "Archived",
-    }
-
+    return TeamProfileResponse(
+        id=db_profile["id"],
+        name=db_profile.get("full_name") or "Unknown", # Should join with profiles
+        title=db_profile.get("job_title"),
+        email=db_profile.get("email"), # Should join with profiles
+        employeeCode=db_profile.get("employee_code"),
+        # profilePhoto=...
+        department=db_profile.get("department"),
+        # reportingManager=...
+        # branch=...
+        timezone=db_profile.get("timezone"),
+        billing=BillingInfo(
+            ratePerHour=db_profile.get("billing_rate", 0) or 0,
+            currency=db_profile.get("billing_currency", "USD")
+        ),
+        weeklyHours=db_profile.get("weekly_hours", 40),
+        dailyTimings=DailyTimings(
+            from_time=str(db_profile.get("daily_timings_from", "09:00")),
+            to_time=str(db_profile.get("daily_timings_to", "17:00"))
+        ),
+        overtimeAllowed=db_profile.get("overtime_allowed", False),
+        employmentStartDate=str(db_profile.get("employment_start_date")) if db_profile.get("employment_start_date") else None,
+        employmentEndDate=str(db_profile.get("employment_end_date")) if db_profile.get("employment_end_date") else None,
+        profileSummary=db_profile.get("profile_summary"),
+        qualifications=quals,
+        skillsAndExpertise=skills,
+        experience=exps,
+        isActive=db_profile.get("is_active", True),
+        status=db_profile.get("status", "Active")
+    )
 
 # ==================== API Endpoints ====================
 
@@ -199,280 +181,147 @@ def _transform_db_to_response(db_profile: dict[str, Any]) -> dict[str, Any]:
 async def get_team_profiles(
     is_active: Optional[bool] = None,
     user: SupabaseUser = Depends(require_supabase_user),
-) -> list[dict[str, Any]]:
-    """Get all team profiles, optionally filtered by active status."""
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> list[TeamProfileResponse]:
     settings = get_settings()
-    headers = _build_supabase_headers()
+    headers = _build_supabase_headers(token=credentials.credentials)
 
-    # Build query URL
-    url = f"{settings.supabase_url}/rest/v1/rpc/get_team_profiles_with_details"
-
-    # Build request body for RPC function
-    rpc_body = {}
+    # We need to join with profiles table to get name/email
+    # select=*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)
+    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)"
+    
+    url = f"{settings.supabase_url}/rest/v1/team_profiles?select={query}"
     if is_active is not None:
-        rpc_body["p_is_active"] = is_active
+        url += f"&is_active=eq.{str(is_active).lower()}"
 
-    profiles_data = await _supabase_request("POST", url, headers, json=rpc_body)
+    data = await _supabase_request("GET", url, headers)
+    
+    if not isinstance(data, list):
+        logger.error(f"Unexpected response from Supabase (expected list): {data}")
+        return []
 
-    # Transform the data
-    transformed_profiles = [_transform_db_to_response(profile) for profile in profiles_data]
+    # Flatten the 'profiles' join
+    for item in data:
+        if not isinstance(item, dict):
+            continue
 
-    return transformed_profiles
-
+        if item.get("profiles"):
+            item["full_name"] = item["profiles"].get("full_name")
+            item["email"] = item["profiles"].get("email")
+            item["avatar_url"] = item["profiles"].get("avatar_url")
+    
+    return [_map_db_to_response(item) for item in data if isinstance(item, dict)]
 
 @router.get("/{profile_id}", response_model=TeamProfileResponse)
 async def get_team_profile(
     profile_id: str,
     user: SupabaseUser = Depends(require_supabase_user),
-) -> dict[str, Any]:
-    """Get a single team profile by ID."""
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> TeamProfileResponse:
     settings = get_settings()
-    headers = _build_supabase_headers()
+    headers = _build_supabase_headers(token=credentials.credentials)
 
-    url = f"{settings.supabase_url}/rest/v1/rpc/get_team_profile_by_id"
-    profile_data = await _supabase_request("POST", url, headers, json={"p_profile_id": profile_id})
+    query = "*,skills:team_skills(*),qualifications:team_qualifications(*),experience:team_experience(*),profiles:profiles!team_profiles_id_fkey(full_name,email,avatar_url)"
+    url = f"{settings.supabase_url}/rest/v1/team_profiles?id=eq.{profile_id}&select={query}"
 
-    if not profile_data or len(profile_data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Team profile with ID {profile_id} not found",
-        )
+    data = await _supabase_request("GET", url, headers)
+    
+    if not isinstance(data, list) or not data:
+        if isinstance(data, dict):
+            logger.error(f"Unexpected response in get_team_profile: {data}")
+        raise HTTPException(status_code=404, detail="Profile not found")
+    
+    item = data[0]
+    if not isinstance(item, dict):
+        raise HTTPException(status_code=500, detail="Invalid profile data format")
 
-    return _transform_db_to_response(profile_data[0])
+    if item.get("profiles"):
+        item["full_name"] = item["profiles"].get("full_name")
+        item["email"] = item["profiles"].get("email")
+    
+    return _map_db_to_response(item)
 
-
-@router.post("/", response_model=TeamProfileResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=TeamProfileResponse)
 async def create_team_profile(
-    profile: TeamProfileCreate,
+    request: TeamProfileCreateRequest,
     user: SupabaseUser = Depends(require_supabase_user),
-) -> dict[str, Any]:
-    """Create a new team profile."""
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> TeamProfileResponse:
     settings = get_settings()
-    headers = _build_supabase_headers()
-
-    # Insert main profile
-    profile_data = {
-        "name": profile.name,
-        "title": profile.title,
-        "email": profile.email,
-        "employee_code": profile.employeeCode,
-        "profile_photo": profile.profilePhoto,
-        "department": profile.department,
-        "reporting_manager": profile.reportingManager,
-        "branch": profile.branch,
-        "location": profile.location,
-        "timezone": profile.timezone,
-        "overtime_allowed": profile.overtimeAllowed,
-        "employment_start_date": profile.employmentStartDate,
-        "employment_end_date": profile.employmentEndDate,
-        "billing_rate_per_hour": profile.billingRatePerHour,
-        "billing_currency": profile.billingCurrency,
-        "weekly_hours": profile.weeklyHours,
-        "daily_timings_from": profile.dailyTimingsFrom,
-        "daily_timings_to": profile.dailyTimingsTo,
-        "profile_summary": profile.profileSummary,
-        "is_active": profile.isActive,
-        "status": "Active" if profile.isActive else "Archived",
-        "created_by": user.id,
+    headers = _build_supabase_headers(token=credentials.credentials)
+    
+    # Resolve Organization ID
+    org_id = settings.default_org_id
+    # Validate if org_id is a valid UUID string if present
+    if org_id:
+        try:
+            UUID(org_id)
+        except ValueError:
+            logger.warning(f"Invalid default_org_id in settings: {org_id}")
+            org_id = None
+            
+    if not org_id:
+        # Fallback: Fetch from user's organizations
+        # Note: mixing sync service call in async route (following project pattern)
+        org_service = OrganizationService(settings)
+        user_orgs = org_service.list_user_organizations(UUID(user.id))
+        if user_orgs:
+            org_id = str(user_orgs[0].id)
+            
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Organization ID is required to create a profile")
+    
+    # Map request to DB fields
+    payload = {
+        "id": user.id, # Enforce own profile for now, or we need ID in request
+        "organization_id": org_id, 
+        "job_title": request.title,
+        "department": request.department,
+        "employee_code": request.employeeCode,
+        "weekly_hours": request.weeklyHours,
+        "overtime_allowed": request.overtimeAllowed,
+        "daily_timings_from": request.dailyTimingsFrom,
+        "daily_timings_to": request.dailyTimingsTo,
+        "timezone": request.timezone,
+        "billing_rate": request.billingRatePerHour,
+        "billing_currency": request.billingCurrency,
+        "profile_summary": request.profileSummary,
+        "employment_start_date": request.employmentStartDate,
+        "employment_end_date": request.employmentEndDate,
+        "is_active": request.isActive,
+        "status": "Active" if request.isActive else "Archived"
     }
-
+    
     url = f"{settings.supabase_url}/rest/v1/team_profiles"
-    created_profile = await _supabase_request("POST", url, headers, json=profile_data)
+    created = await _supabase_request("POST", url, headers, json=payload)
+    
+    if not isinstance(created, list) or not created or not isinstance(created[0], dict):
+         logger.error(f"Failed to create profile, response: {created}")
+         raise HTTPException(status_code=400, detail="Failed to create profile")
+    
+    pid = created[0]["id"]
+    
+    # Skills
+    if request.skillsAndExpertise:
+        s_data = [{"profile_id": pid, "skill_name": s} for s in request.skillsAndExpertise]
+        await _supabase_request("POST", f"{settings.supabase_url}/rest/v1/team_skills", headers, json=s_data)
 
-    if not created_profile or len(created_profile) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create team profile",
-        )
+    # Qualifications
+    if request.qualifications:
+        q_data = [{"profile_id": pid, "degree": q} for q in request.qualifications]
+        await _supabase_request("POST", f"{settings.supabase_url}/rest/v1/team_qualifications", headers, json=q_data)
+        
+    # Experience
+    if request.experience:
+        e_data = []
+        for e in request.experience:
+             e_data.append({
+                 "profile_id": pid,
+                 "company": e.get("company"),
+                 "role": e.get("role"),
+                 "years_duration": e.get("years"),
+                 "description": e.get("description")
+             })
+        await _supabase_request("POST", f"{settings.supabase_url}/rest/v1/team_experience", headers, json=e_data)
 
-    profile_id = created_profile[0]["id"]
-
-    # Insert qualifications
-    if profile.qualifications:
-        qualifications_data = [
-            {
-                "team_profile_id": profile_id,
-                "qualification": qual,
-                "sort_order": idx,
-            }
-            for idx, qual in enumerate(profile.qualifications)
-        ]
-        qual_url = f"{settings.supabase_url}/rest/v1/team_profile_qualifications"
-        await _supabase_request("POST", qual_url, headers, json=qualifications_data)
-
-    # Insert skills
-    if profile.skillsAndExpertise:
-        skills_data = [
-            {
-                "team_profile_id": profile_id,
-                "skill": skill,
-                "sort_order": idx,
-            }
-            for idx, skill in enumerate(profile.skillsAndExpertise)
-        ]
-        skills_url = f"{settings.supabase_url}/rest/v1/team_profile_skills"
-        await _supabase_request("POST", skills_url, headers, json=skills_data)
-
-    # Insert experience
-    if profile.experience:
-        experience_data = [
-            {
-                "team_profile_id": profile_id,
-                "years": exp.years,
-                "role": exp.role,
-                "company": exp.company,
-                "description": exp.description,
-                "sort_order": idx,
-            }
-            for idx, exp in enumerate(profile.experience)
-        ]
-        exp_url = f"{settings.supabase_url}/rest/v1/team_profile_experience"
-        await _supabase_request("POST", exp_url, headers, json=experience_data)
-
-    # Fetch the complete profile
-    return await get_team_profile(profile_id, user)
-
-
-@router.patch("/{profile_id}", response_model=TeamProfileResponse)
-async def update_team_profile(
-    profile_id: str,
-    profile_update: TeamProfileUpdate,
-    user: SupabaseUser = Depends(require_supabase_user),
-) -> dict[str, Any]:
-    """Update a team profile."""
-    settings = get_settings()
-    headers = _build_supabase_headers()
-
-    # Build update data for main profile
-    update_data = {}
-    if profile_update.name is not None:
-        update_data["name"] = profile_update.name
-    if profile_update.title is not None:
-        update_data["title"] = profile_update.title
-    if profile_update.email is not None:
-        update_data["email"] = profile_update.email
-    if profile_update.employeeCode is not None:
-        update_data["employee_code"] = profile_update.employeeCode
-    if profile_update.profilePhoto is not None:
-        update_data["profile_photo"] = profile_update.profilePhoto
-    if profile_update.department is not None:
-        update_data["department"] = profile_update.department
-    if profile_update.reportingManager is not None:
-        update_data["reporting_manager"] = profile_update.reportingManager
-    if profile_update.branch is not None:
-        update_data["branch"] = profile_update.branch
-    if profile_update.location is not None:
-        update_data["location"] = profile_update.location
-    if profile_update.timezone is not None:
-        update_data["timezone"] = profile_update.timezone
-    if profile_update.overtimeAllowed is not None:
-        update_data["overtime_allowed"] = profile_update.overtimeAllowed
-    if profile_update.employmentStartDate is not None:
-        update_data["employment_start_date"] = profile_update.employmentStartDate
-    if profile_update.employmentEndDate is not None:
-        update_data["employment_end_date"] = profile_update.employmentEndDate
-    if profile_update.billingRatePerHour is not None:
-        update_data["billing_rate_per_hour"] = profile_update.billingRatePerHour
-    if profile_update.billingCurrency is not None:
-        update_data["billing_currency"] = profile_update.billingCurrency
-    if profile_update.weeklyHours is not None:
-        update_data["weekly_hours"] = profile_update.weeklyHours
-    if profile_update.dailyTimingsFrom is not None:
-        update_data["daily_timings_from"] = profile_update.dailyTimingsFrom
-    if profile_update.dailyTimingsTo is not None:
-        update_data["daily_timings_to"] = profile_update.dailyTimingsTo
-    if profile_update.profileSummary is not None:
-        update_data["profile_summary"] = profile_update.profileSummary
-    if profile_update.isActive is not None:
-        update_data["is_active"] = profile_update.isActive
-        update_data["status"] = "Active" if profile_update.isActive else "Archived"
-
-    update_data["updated_by"] = user.id
-
-    # Update main profile
-    if update_data:
-        url = f"{settings.supabase_url}/rest/v1/team_profiles?id=eq.{profile_id}"
-        await _supabase_request("PATCH", url, headers, json=update_data)
-
-    # Update qualifications if provided
-    if profile_update.qualifications is not None:
-        # Delete existing qualifications
-        del_url = f"{settings.supabase_url}/rest/v1/team_profile_qualifications?team_profile_id=eq.{profile_id}"
-        await _supabase_request("DELETE", del_url, headers)
-
-        # Insert new qualifications
-        if profile_update.qualifications:
-            qualifications_data = [
-                {
-                    "team_profile_id": profile_id,
-                    "qualification": qual,
-                    "sort_order": idx,
-                }
-                for idx, qual in enumerate(profile_update.qualifications)
-            ]
-            qual_url = f"{settings.supabase_url}/rest/v1/team_profile_qualifications"
-            await _supabase_request("POST", qual_url, headers, json=qualifications_data)
-
-    # Update skills if provided
-    if profile_update.skillsAndExpertise is not None:
-        # Delete existing skills
-        del_url = f"{settings.supabase_url}/rest/v1/team_profile_skills?team_profile_id=eq.{profile_id}"
-        await _supabase_request("DELETE", del_url, headers)
-
-        # Insert new skills
-        if profile_update.skillsAndExpertise:
-            skills_data = [
-                {
-                    "team_profile_id": profile_id,
-                    "skill": skill,
-                    "sort_order": idx,
-                }
-                for idx, skill in enumerate(profile_update.skillsAndExpertise)
-            ]
-            skills_url = f"{settings.supabase_url}/rest/v1/team_profile_skills"
-            await _supabase_request("POST", skills_url, headers, json=skills_data)
-
-    # Update experience if provided
-    if profile_update.experience is not None:
-        # Delete existing experience
-        del_url = f"{settings.supabase_url}/rest/v1/team_profile_experience?team_profile_id=eq.{profile_id}"
-        await _supabase_request("DELETE", del_url, headers)
-
-        # Insert new experience
-        if profile_update.experience:
-            experience_data = [
-                {
-                    "team_profile_id": profile_id,
-                    "years": exp.years,
-                    "role": exp.role,
-                    "company": exp.company,
-                    "description": exp.description,
-                    "sort_order": idx,
-                }
-                for idx, exp in enumerate(profile_update.experience)
-            ]
-            exp_url = f"{settings.supabase_url}/rest/v1/team_profile_experience"
-            await _supabase_request("POST", exp_url, headers, json=experience_data)
-
-    # Fetch the updated profile
-    return await get_team_profile(profile_id, user)
-
-
-@router.delete("/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_team_profile(
-    profile_id: str,
-    user: SupabaseUser = Depends(require_supabase_user),
-) -> None:
-    """Delete a team profile (soft delete by setting is_active to False)."""
-    settings = get_settings()
-    headers = _build_supabase_headers()
-
-    # Soft delete by setting is_active to False
-    update_data = {
-        "is_active": False,
-        "status": "Archived",
-        "updated_by": user.id,
-    }
-
-    url = f"{settings.supabase_url}/rest/v1/team_profiles?id=eq.{profile_id}"
-    await _supabase_request("PATCH", url, headers, json=update_data)
+    return await get_team_profile(pid, user, credentials)

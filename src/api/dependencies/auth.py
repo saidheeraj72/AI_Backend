@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
+from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.core.config import get_settings
-
+from src.services.organization_service import OrganizationService
 
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,7 @@ class SupabaseUser:
     email: Optional[str]
     role: Optional[str]
     claims: Mapping[str, Any]
+    profile: Optional[dict[str, Any]] = None
 
 
 def _decode_supabase_token(token: str, *, secret: str) -> Mapping[str, Any]:
@@ -67,4 +71,28 @@ async def require_supabase_user(
 
     settings = get_settings()
     claims = _decode_supabase_token(token, secret=settings.supabase_jwt_secret)
-    return _build_user_from_claims(claims)
+    user = _build_user_from_claims(claims)
+    
+    # Fetch full profile from DB
+    # We create a service instance here. In a real app, we might use dependency injection for the service.
+    try:
+        org_service = OrganizationService(settings=settings, logger=logger)
+        profile = org_service.get_profile(UUID(user.id))
+        
+        if profile:
+             # Create a new SupabaseUser with profile data
+             # We can also fetch roles here if needed for the user object
+             # For now, just attaching the basic profile dict
+             return SupabaseUser(
+                 id=user.id,
+                 email=user.email,
+                 role=user.role,
+                 claims=user.claims,
+                 profile=profile.dict()
+             )
+    except Exception as e:
+        logger.warning(f"Failed to fetch user profile for {user.id}: {e}")
+        # Fallback to JWT-only user if DB fails (or let it fail if strict)
+        pass
+
+    return user
