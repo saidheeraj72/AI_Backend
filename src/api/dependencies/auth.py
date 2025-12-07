@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 from uuid import UUID
 
@@ -80,6 +81,15 @@ async def require_supabase_user(
         profile = org_service.get_profile(UUID(user.id))
         
         if profile:
+             # Check for subscription expiry
+             # If expiry_date is None, user has permanent/lifetime access.
+             # If expiry_date is set and in the past, block access.
+             if profile.expiry_date and profile.expiry_date < datetime.now(timezone.utc):
+                 raise HTTPException(
+                     status_code=status.HTTP_403_FORBIDDEN,
+                     detail="Your free trial or subscription has expired. Please upgrade to continue."
+                 )
+
              # Create a new SupabaseUser with profile data
              # We can also fetch roles here if needed for the user object
              # For now, just attaching the basic profile dict
@@ -90,6 +100,8 @@ async def require_supabase_user(
                  claims=user.claims,
                  profile=profile.dict()
              )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"Failed to fetch user profile for {user.id}: {e}")
         # Fallback to JWT-only user if DB fails (or let it fail if strict)

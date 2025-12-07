@@ -43,10 +43,13 @@ def _get_user_context(user_id: str):
             org_id = user_orgs[0].id
             
     if not org_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No Organization context found. User belongs to no organizations and no default is set."
-        )
+        # Instead of failing, return a context indicating no organization
+        return {
+            "org_id": None,
+            "is_admin": False,
+            "is_branch_manager": False,
+            "roles": {"Viewer"}
+        }
     
     roles = org_service.get_user_roles(UUID(user_id), org_id)
     role_names = {r.name for r in roles}
@@ -64,11 +67,17 @@ def _get_user_context(user_id: str):
 @router.get("/user-context", response_model=dict[str, Any])
 async def get_user_settings_context(current_user: SupabaseUser = Depends(require_supabase_user)) -> dict[str, Any]:
     ctx = _get_user_context(current_user.id)
+    profile = org_service.get_profile(UUID(current_user.id))
+    
+    expiry = profile.expiry_date.isoformat() if profile and profile.expiry_date else None
+    logger.info(f"User Context for {current_user.id}: Expiry={expiry}, Profile Expiry={profile.expiry_date if profile else 'No Profile'}")
+    
     return {
         "user_role": list(ctx["roles"])[0] if ctx["roles"] else "Viewer",
         "is_admin": ctx["is_admin"],
         "is_branch_manager": ctx["is_branch_manager"],
-        "org_id": str(ctx["org_id"])
+        "org_id": str(ctx["org_id"]) if ctx["org_id"] else None,
+        "expiry_date": expiry
     }
 
 @router.get("/groups/configuration", response_model=dict[str, Any])
