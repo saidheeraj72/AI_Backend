@@ -173,6 +173,13 @@ async def save_user(
              # Filter out any None/empty strings if the UI sends them
              clean_ids = [UUID(bid) for bid in branch_ids if bid]
              org_service.update_user_branch_memberships(UUID(target_user_id), ctx["org_id"], clean_ids)
+             
+        # Update expiry date if provided in payload
+        # Note: 'expiry_date' key presence in payload matters. If it's explicitly None, we clear it.
+        # If it's missing, we don't touch it.
+        if "expiry_date" in payload:
+             logger.info(f"Updating expiry date for {target_user_id} to {payload['expiry_date']}")
+             org_service.update_user_profile(UUID(target_user_id), {"expiry_date": payload["expiry_date"]})
 
     return {"message": "User saved"}
 
