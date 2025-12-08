@@ -285,7 +285,8 @@ class OrganizationService:
     def get_profile(self, user_id: UUID) -> Optional[Profile]:
         client = self._require_client()
         try:
-            response = client.table("profiles").select("*").eq("id", str(user_id)).single().execute()
+            # Explicitly select columns to ensure expiry_date is fetched
+            response = client.table("profiles").select("id, email, full_name, avatar_url, created_at, updated_at, expiry_date").eq("id", str(user_id)).single().execute()
             if response.data:
                 return Profile(**response.data)
         except Exception as exc:
@@ -298,7 +299,8 @@ class OrganizationService:
         client = self._require_client()
         try:
             # 1. Fetch Profiles (Paginated)
-            query = client.table("profiles").select("*", count="exact")
+            # Explicitly select columns including expiry_date
+            query = client.table("profiles").select("id, email, full_name, avatar_url, created_at, updated_at, expiry_date", count="exact")
             
             if search:
                 query = query.ilike("email", f"%{search}%")
@@ -357,7 +359,8 @@ class OrganizationService:
                     "role": role_name,
                     "role_id": role_id,
                     "branch_ids": user_branch_ids,
-                    "branch_names": user_branch_names
+                    "branch_names": user_branch_names,
+                    "expiry_date": p.get("expiry_date")
                 })
 
             return {"users": users, "total": total}

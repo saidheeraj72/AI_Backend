@@ -77,6 +77,7 @@ class Profile(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    expiry_date: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
