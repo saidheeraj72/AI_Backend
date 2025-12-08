@@ -293,6 +293,21 @@ class OrganizationService:
             self.logger.warning(f"Profile not found for {user_id}: {exc}")
         return None
 
+    def update_user_profile(self, user_id: UUID, updates: Dict[str, Any]) -> Optional[Profile]:
+        client = self._require_client()
+        try:
+            self.logger.info(f"Updating profile {user_id} with: {updates}")
+            # Explicitly select columns to ensure we get back what we expect, especially expiry_date
+            response = client.table("profiles").update(updates).eq("id", str(user_id)).select("id, email, full_name, avatar_url, created_at, updated_at, expiry_date").execute()
+            
+            self.logger.info(f"Update response data: {response.data}")
+            
+            if response.data:
+                return Profile(**response.data[0])
+        except Exception as exc:
+            self.logger.error(f"Error updating profile for {user_id}: {exc}")
+        return None
+
     # --- New Methods for Admin Page ---
 
     def list_users_paginated(self, org_id: UUID, offset: int = 0, limit: int = 10, search: str = "") -> Dict[str, Any]:
@@ -499,11 +514,28 @@ class OrganizationService:
         query = client.table("roles").select("*").eq("name", name)
         if org_id:
             query = query.eq("organization_id", str(org_id))
-        # else: implies strictly global/system role search if we supported it
-             
+        
         response = query.limit(1).execute()
         if response.data:
             return Role(**response.data[0])
+            
+        # Self-healing: If standard role doesn't exist for this org, create it.
+        # This handles cases where org was created without seeding roles.
+        STANDARD_ROLES = ["Viewer", "Admin", "Branch Manager", "OrgOwner"]
+        if org_id and name in STANDARD_ROLES:
+            try:
+                # Default permissions can be refined. For now, empty or basic.
+                permissions = {}
+                if name == "OrgOwner":
+                    permissions = {"all": True}
+                elif name == "Admin":
+                    permissions = {"manage_users": True, "manage_roles": True}
+                
+                self.logger.info(f"Auto-creating missing standard role '{name}' for org {org_id}")
+                return self.create_role(org_id, name, permissions)
+            except Exception as e:
+                self.logger.error(f"Failed to auto-create role {name}: {e}")
+                
         return None
 
     def update_user_role(self, user_id: UUID, org_id: UUID, role_name: str) -> None:

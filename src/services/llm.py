@@ -50,6 +50,7 @@ class LLMService:
         prompt: Optional[str],
         image_bytes: Optional[bytes],
         image_mime_type: Optional[str],
+        history: Optional[list[dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
         if model_key not in LLM_MODELS:
             raise ValueError(f"Unknown model key: {model_key}")
@@ -58,6 +59,9 @@ class LLMService:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": model_info["system_prompt"]}
         ]
+
+        if history:
+            messages.extend(history)
 
         supports_vision = model_info["supports_vision"]
 
@@ -97,12 +101,13 @@ class LLMService:
         prompt: Optional[str] = None,
         image_bytes: Optional[bytes] = None,
         image_mime_type: Optional[str] = None,
+        history: Optional[list[dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         model_info = LLM_MODELS.get(model_key)
         if model_info is None:
             raise ValueError(f"Unknown model key: {model_key}")
 
-        messages = self._build_messages(model_key, prompt, image_bytes, image_mime_type)
+        messages = self._build_messages(model_key, prompt, image_bytes, image_mime_type, history)
 
         self.logger.info("Sending chat request to model %s", model_info["model"])
         response = self.client.chat.completions.create(

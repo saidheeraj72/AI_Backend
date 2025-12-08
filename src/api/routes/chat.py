@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Optional, Sequence, Union
 from uuid import uuid4, UUID
 
@@ -18,8 +21,10 @@ from src.models.schemas import (
     RAGChatResponse,
 )
 from src.services.chat_history import ChatHistoryService
+from src.services.context_cache import ContextCacheService
 from src.services.llm import LLMService
 from src.services.metadata import MetadataService
+from src.services.pdf_processor import PDFProcessor
 from src.services.rag import RAGChatService
 from src.services.vectorstore import VectorStoreService
 from src.services.websearch import WebSearchService
@@ -51,6 +56,8 @@ rag_service = RAGChatService(
 chat_history_service = ChatHistoryService(settings, logger=logger)
 websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 org_service = OrganizationService(settings=settings, logger=logger)
+pdf_processor = PDFProcessor(logger=logger)
+context_cache_service = ContextCacheService(Path("data"), logger=logger)
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -117,6 +124,7 @@ async def chat(
     user_id: str = Form(...),
     chat_session_id: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
+    files: Optional[list[UploadFile]] = File(None),
     websearch: bool = Form(False),
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> ChatResponse:
@@ -139,7 +147,53 @@ async def chat(
 
     _ensure_user_access(current_user, user_id)
 
-    augmented_prompt = prompt
+    # Process uploaded documents (PDFs) and update context cache
+    if files:
+        for file in files:
+            if not file.filename.lower().endswith(".pdf"):
+                continue  # Skip non-PDFs for now, or raise error
+
+            with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                shutil.copyfileobj(file.file, tmp)
+                tmp_path = Path(tmp.name)
+            
+            try:
+                # Run PDF processing in threadpool to avoid blocking event loop
+                doc = await run_in_threadpool(pdf_processor.process_pdf, tmp_path)
+                if doc and doc.page_content:
+                    content = doc.page_content
+                    # Approximate token count: 1 token ~= 4 chars
+                    token_count = len(content) // 4
+                    if token_count > 1000:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"File '{file.filename}' exceeds the 1000 token limit ({token_count} tokens). Please upload a smaller file."
+                        )
+                    
+                    formatted_content = f"## Document: {file.filename}\n{content}"
+                    context_cache_service.append_context(session_id, formatted_content)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error processing file {file.filename}: {e}")
+                # Optionally raise error or just skip
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                await file.close()
+
+    # Construct the final prompt for the LLM
+    llm_prompt_parts = []
+    
+    # 1. Add cached context (from previous or current uploads)
+    cached_context = context_cache_service.get_context(session_id)
+    if cached_context:
+        llm_prompt_parts.append(
+            f"Here is the content of the uploaded documents for this session:\n{cached_context}\n"
+            "Please use the above document content to answer the user's request."
+        )
+
+    # 2. Add websearch summary if applicable
     if websearch and prompt:
         try:
             search_summary = await run_in_threadpool(
@@ -153,20 +207,45 @@ async def chat(
             search_summary = None
 
         if search_summary:
-            augmented_prompt = (
-                "Use the following web search summary to answer the question.\n"
-                f"{search_summary}\n\n"
-                "User question: "
-                f"{prompt}"
+            llm_prompt_parts.append(
+                f"Use the following web search summary to answer the question.\n{search_summary}"
             )
+
+    # 3. Add user prompt
+    if prompt:
+        llm_prompt_parts.append(prompt)
+    
+    final_prompt = "\n\n".join(llm_prompt_parts).strip()
+
+    if not final_prompt and not image_bytes:
+        raise HTTPException(status_code=400, detail="Prompt or image is required")
+
+    # Fetch and format chat history
+    history_records = []
+    try:
+        history_records = await run_in_threadpool(
+            chat_history_service.get_chat_history,
+            chat_id=session_id,
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch history: {e}")
+
+    llm_history = []
+    for record in history_records:
+        if record.get("user_input"):
+            llm_history.append({"role": "user", "content": record["user_input"]})
+        if record.get("response"):
+            llm_history.append({"role": "assistant", "content": record["response"]})
 
     try:
         result = await run_in_threadpool(
             llm_service.chat,
             model_key,
-            prompt=augmented_prompt,
+            prompt=final_prompt,
             image_bytes=image_bytes,
             image_mime_type=image_mime,
+            history=llm_history,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -180,13 +259,13 @@ async def chat(
         user_id=user_id,
         model_key=model_key,
         model_name=result.get("model_name", ""),
-        user_input=prompt,
+        user_input=prompt, # Save original user input, not the context-heavy prompt
         response=result.get("response", ""),
         usage=result.get("usage"),
         has_image=image_bytes is not None,
         image_mime_type=image_mime,
         interaction_type="standard",
-        org_id=None, # Org ID logic removed or handled by user_id lookup if needed
+        org_id=None, 
     )
 
     result["chat_id"] = session_id
