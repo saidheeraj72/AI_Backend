@@ -34,11 +34,12 @@ class VectorStoreService:
         )
         self._pinecone_client = None
         self._pinecone_index = None
+        self._pinecone_chat_index = None
         self._pinecone_namespace = (self.settings.pinecone_namespace or "").strip()
 
         if not self.settings.pinecone_configured:
             raise RuntimeError(
-                "Pinecone credentials are required; set PINECONE_API_KEY and PINECONE_INDEX"
+                "Pinecone credentials are required; set PINECONE_API_KEY, PINECONE_INDEX and PINECONE_CHAT_INDEX"
             )
 
         if Pinecone is None:
@@ -55,9 +56,13 @@ class VectorStoreService:
             self._pinecone_index = self._pinecone_client.Index(
                 self.settings.pinecone_index
             )
+            self._pinecone_chat_index = self._pinecone_client.Index(
+                self.settings.pinecone_chat_index
+            )
             self.logger.info(
-                "Initialized Pinecone index '%s'",
+                "Initialized Pinecone indexes '%s' and '%s'",
                 self.settings.pinecone_index,
+                self.settings.pinecone_chat_index,
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.error("Failed to initialize Pinecone client: %s", exc)
@@ -68,8 +73,11 @@ class VectorStoreService:
         query: str,
         *,
         document_paths: Optional[Sequence[str]] = None,
+        user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
         top_k: int = 4,
         oversample: int = 3,
+        pinecone_index_override=None,
     ) -> list[Tuple[Document, float]]:
         """Retrieve the most similar chunks for a query, optionally scoped to selected documents."""
 
@@ -79,10 +87,16 @@ class VectorStoreService:
             raise ValueError("top_k must be greater than zero")
 
         return self._search_pinecone(
-            query, document_paths=document_paths, top_k=top_k, oversample=oversample
+            query, 
+            document_paths=document_paths,
+            user_id=user_id,
+            chat_id=chat_id, 
+            top_k=top_k, 
+            oversample=oversample,
+            pinecone_index_override=pinecone_index_override,
         )
 
-    def index_documents(self, documents: Iterable[Document]) -> int:
+    def index_documents(self, documents: Iterable[Document], pinecone_index_override=None) -> int:
         """Embed documents and persist them to the configured vector store."""
         docs = [doc for doc in documents if doc]
         if not docs:
@@ -92,16 +106,56 @@ class VectorStoreService:
         splits = self.text_splitter.split_documents(docs)
         self.logger.info("Prepared %s text chunks for indexing", len(splits))
 
-        return self._index_pinecone(splits)
+        return self._index_pinecone(splits, pinecone_index_override=pinecone_index_override)
 
-    def remove_documents(self, sources: Sequence[str]) -> int:
+    def remove_documents(self, sources: Sequence[str], pinecone_index_override=None) -> int:
         """Remove all embeddings associated with the provided source paths."""
-        return self._remove_pinecone(sources)
+        return self._remove_pinecone(sources, pinecone_index_override=pinecone_index_override)
+
+    def remove_by_chat_id(self, chat_id: str) -> int:
+        """Remove all embeddings associated with the provided chat_id from the chat-session index."""
+        if self._pinecone_chat_index is None:
+            self.logger.warning("Pinecone chat index not available; nothing to remove")
+            return 0
+        
+        metadata_filter = {"chat_id": {"$eq": chat_id}}
+        namespace = self._pinecone_namespace or None
+        
+        try:
+            stats = self._pinecone_chat_index.describe_index_stats(filter=metadata_filter)
+        except Exception:  # pragma: no cover - defensive logging
+            stats = {}
+
+        namespace_key = self._pinecone_namespace or ""
+        if isinstance(stats, dict):
+            vector_count = (
+                stats.get("namespaces", {})
+                .get(namespace_key, {})
+                .get("vector_count", 0)
+            )
+        else:
+            vector_count = 0
+
+        try:
+            self._pinecone_chat_index.delete(
+                filter=metadata_filter,
+                namespace=namespace,
+            )
+            self.logger.info(
+                "Requested deletion of vectors with chat_id %s from Pinecone chat index",
+                chat_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Failed to delete vectors from Pinecone chat index: %s", exc)
+            raise
+
+        return int(vector_count)
 
     # Pinecone helpers -------------------------------------------------
 
-    def _index_pinecone(self, splits: list[Document]) -> int:
-        if self._pinecone_index is None:
+    def _index_pinecone(self, splits: list[Document], pinecone_index_override=None) -> int:
+        pinecone_index = pinecone_index_override if pinecone_index_override is not None else self._pinecone_index
+        if pinecone_index is None:
             raise ValueError("Pinecone index is not configured")
 
         payloads: list[dict] = []
@@ -115,17 +169,25 @@ class VectorStoreService:
 
         for chunk, vector in zip(splits, embeddings):
             source = chunk.metadata.get("source", "")
+            user_id = chunk.metadata.get("user_id")
+            chat_id = chunk.metadata.get("chat_id")
             counter = per_source_counts.get(source, 0)
             per_source_counts[source] = counter + 1
             vector_id = f"{source}::chunk-{counter}"
+            metadata = {
+                "source": source,
+                "text": chunk.page_content,
+            }
+            if user_id:
+                metadata["user_id"] = user_id
+            if chat_id:
+                metadata["chat_id"] = chat_id
+
             payloads.append(
                 {
                     "id": vector_id,
                     "values": vector,
-                    "metadata": {
-                        "source": source,
-                        "text": chunk.page_content,
-                    },
+                    "metadata": metadata,
                 }
             )
 
@@ -134,11 +196,10 @@ class VectorStoreService:
 
         namespace = self._pinecone_namespace or None
         try:
-            self._pinecone_index.upsert(vectors=payloads, namespace=namespace)
+            pinecone_index.upsert(vectors=payloads, namespace=namespace)
             self.logger.info(
-                "Upserted %s vectors to Pinecone index %s",
+                "Upserted %s vectors to Pinecone",
                 len(payloads),
-                self.settings.pinecone_index,
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.exception("Failed to upsert vectors to Pinecone: %s", exc)
@@ -151,32 +212,41 @@ class VectorStoreService:
         query: str,
         *,
         document_paths: Optional[Sequence[str]] = None,
+        user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
         top_k: int,
         oversample: int,
+        pinecone_index_override=None,
     ) -> list[Tuple[Document, float]]:
-        if self._pinecone_index is None:
+        pinecone_index = pinecone_index_override if pinecone_index_override is not None else self._pinecone_index
+        if pinecone_index is None:
             raise ValueError("Pinecone index is not configured")
 
         vector = self.embedding_model.embed_query(query)
         allowed_sources = [path for path in (document_paths or []) if path]
-        metadata_filter = None
+        metadata_filter = {}
         if allowed_sources:
             if len(allowed_sources) == 1:
-                metadata_filter = {"source": {"$eq": allowed_sources[0]}}
+                metadata_filter["source"] = {"$eq": allowed_sources[0]}
             else:
-                metadata_filter = {"source": {"$in": allowed_sources}}
+                metadata_filter["source"] = {"$in": allowed_sources}
+        
+        if user_id:
+            metadata_filter["user_id"] = {"$eq": user_id}
+        if chat_id:
+            metadata_filter["chat_id"] = {"$eq": chat_id}
 
         sample_size = max(top_k, top_k * max(1, oversample))
         sample_size = max(1, min(sample_size, 100))  # Pinecone limit safeguard
 
         namespace = self._pinecone_namespace or None
         try:
-            response = self._pinecone_index.query(
+            response = pinecone_index.query(
                 vector=vector,
                 top_k=sample_size,
                 include_metadata=True,
                 namespace=namespace,
-                filter=metadata_filter,
+                filter=metadata_filter if metadata_filter else None,
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.exception("Pinecone query failed: %s", exc)
@@ -196,8 +266,9 @@ class VectorStoreService:
 
         return results[:top_k]
 
-    def _remove_pinecone(self, sources: Sequence[str]) -> int:
-        if self._pinecone_index is None:
+    def _remove_pinecone(self, sources: Sequence[str], pinecone_index_override=None) -> int:
+        pinecone_index = pinecone_index_override if pinecone_index_override is not None else self._pinecone_index
+        if pinecone_index is None:
             self.logger.warning("Pinecone index not available; nothing to remove")
             return 0
 
@@ -213,7 +284,7 @@ class VectorStoreService:
         namespace = self._pinecone_namespace or None
 
         try:
-            stats = self._pinecone_index.describe_index_stats(filter=metadata_filter)
+            stats = pinecone_index.describe_index_stats(filter=metadata_filter)
         except Exception:  # pragma: no cover - defensive logging
             stats = {}
 
@@ -228,7 +299,7 @@ class VectorStoreService:
             vector_count = 0
 
         try:
-            self._pinecone_index.delete(
+            pinecone_index.delete(
                 filter=metadata_filter,
                 namespace=namespace,
             )

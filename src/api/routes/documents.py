@@ -96,6 +96,7 @@ async def upload_document(
     branch_ids: list[str] = Form(default=[]),
     branch_name: str | None = Form(default=None),
     description: str | None = Form(default=None),
+    chat_id: str | None = Form(default=None),  # New parameter
     current_user: SupabaseUser = Depends(require_supabase_user),
 ) -> StreamingResponse:
     """
@@ -136,6 +137,8 @@ async def upload_document(
             org_id=None,
             created_by=current_user.id,
             description=description,
+            user_id=current_user.id,  # Pass user_id
+            chat_id=chat_id,          # Pass chat_id
         ),
         media_type="application/x-ndjson"
     )

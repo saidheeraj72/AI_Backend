@@ -62,6 +62,8 @@ class DocumentIngestor:
         org_id: str | None = None,
         created_by: str | None = None,
         description: str | None = None,
+        user_id: str | None = None,  # New parameter
+        chat_id: str | None = None,  # New parameter
     ) -> AsyncGenerator[str, None]:
         """
         Ingest uploads and yield progress events as JSON strings.
@@ -87,10 +89,19 @@ class DocumentIngestor:
                         continue
 
                     document.metadata["source"] = relative_path.as_posix()
+                    if user_id:
+                        document.metadata["user_id"] = user_id
+                    if chat_id:
+                        document.metadata["chat_id"] = chat_id
+
+                    # Determine which Pinecone index to use
+                    pinecone_index_to_use = None
+                    if chat_id:
+                        pinecone_index_to_use = self.vector_service._pinecone_chat_index
 
                     # 3. Index Vectors
                     yield json.dumps({"type": "progress", "file": filename, "step": "indexing", "message": "Generating embeddings..."}) + "\n"
-                    chunks_indexed = self.vector_service.index_documents([document])
+                    chunks_indexed = self.vector_service.index_documents([document], pinecone_index_override=pinecone_index_to_use)
                     
                     if chunks_indexed == 0:
                         yield json.dumps({"type": "error", "file": filename, "error": "No content indexed"}) + "\n"
@@ -137,6 +148,8 @@ class DocumentIngestor:
         org_id: str | None = None,
         created_by: str | None = None,
         description: str | None = None,
+        user_id: str | None = None, # New parameter
+        chat_id: str | None = None, # New parameter
     ) -> DocumentIngestResponse:
         """
         Legacy non-streaming method (wraps the stream or implements logic directly).
@@ -148,7 +161,14 @@ class DocumentIngestor:
         total_chunks = 0
 
         async for line in self.ingest_uploads_stream(
-            uploads, branch_ids, branch_name, org_id=org_id, created_by=created_by, description=description
+            uploads, 
+            branch_ids, 
+            branch_name, 
+            org_id=org_id, 
+            created_by=created_by, 
+            description=description,
+            user_id=user_id, # Pass new parameter
+            chat_id=chat_id, # Pass new parameter
         ):
             event = json.loads(line)
             if event["type"] == "complete":
