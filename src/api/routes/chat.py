@@ -31,6 +31,9 @@ from src.services.websearch import WebSearchService
 from src.services.organization_service import OrganizationService
 from src.utils.paths import normalize_relative_path
 
+from src.services.session_store import SessionStoreService
+from langchain_core.documents import Document
+
 router = APIRouter(prefix="/chat", tags=["chat"])
 rag_router = APIRouter(prefix="/rag", tags=["rag"])
 
@@ -58,6 +61,7 @@ websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 org_service = OrganizationService(settings=settings, logger=logger)
 pdf_processor = PDFProcessor(logger=logger)
 context_cache_service = ContextCacheService(Path("data"), logger=logger)
+session_store = SessionStoreService(logger=logger)
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -147,7 +151,7 @@ async def chat(
 
     _ensure_user_access(current_user, user_id)
 
-    # Process uploaded documents (PDFs) and update context cache
+    # Process uploaded documents (PDFs) and update session store
     if files:
         for file in files:
             if not file.filename.lower().endswith(".pdf"):
@@ -161,17 +165,24 @@ async def chat(
                 # Run PDF processing in threadpool to avoid blocking event loop
                 doc = await run_in_threadpool(pdf_processor.process_pdf, tmp_path)
                 if doc and doc.page_content:
-                    content = doc.page_content
-                    # Approximate token count: 1 token ~= 4 chars
-                    token_count = len(content) // 4
-                    if token_count > 1000:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail=f"File '{file.filename}' exceeds the 1000 token limit ({token_count} tokens). Please upload a smaller file."
-                        )
+                    # Update metadata
+                    doc.metadata["source"] = file.filename
                     
-                    formatted_content = f"## Document: {file.filename}\n{content}"
-                    context_cache_service.append_context(session_id, formatted_content)
+                    # Split into chunks
+                    chunks = await run_in_threadpool(
+                        vector_service.text_splitter.split_documents, [doc]
+                    )
+                    
+                    if chunks:
+                        texts = [chunk.page_content for chunk in chunks]
+                        # Generate embeddings
+                        embeddings = await run_in_threadpool(
+                            vector_service.embedding_model.embed_documents, texts
+                        )
+                        
+                        # Store in session memory
+                        session_store.add_documents(session_id, chunks, embeddings)
+
             except HTTPException:
                 raise
             except Exception as e:
@@ -185,13 +196,27 @@ async def chat(
     # Construct the final prompt for the LLM
     llm_prompt_parts = []
     
-    # 1. Add cached context (from previous or current uploads)
-    cached_context = context_cache_service.get_context(session_id)
-    if cached_context:
-        llm_prompt_parts.append(
-            f"Here is the content of the uploaded documents for this session:\n{cached_context}\n"
-            "Please use the above document content to answer the user's request."
-        )
+    # 1. Add cached context from session store (RAG)
+    if prompt:
+        try:
+            query_vector = await run_in_threadpool(
+                vector_service.embedding_model.embed_query, prompt
+            )
+            results = session_store.search(session_id, query_vector, top_k=5)
+            
+            if results:
+                context_parts = []
+                for doc, score in results:
+                    source_name = doc.metadata.get('source', 'uploaded document')
+                    context_parts.append(f"Source: {source_name}\nContent: {doc.page_content}")
+                
+                cached_context = "\n\n".join(context_parts)
+                llm_prompt_parts.append(
+                    f"Here is the content of the uploaded documents for this session (retrieved via RAG):\n{cached_context}\n"
+                    "Please use the above document content to answer the user's request."
+                )
+        except Exception as e:
+            logger.error(f"Error retrieving session context: {e}")
 
     # 2. Add websearch summary if applicable
     if websearch and prompt:
