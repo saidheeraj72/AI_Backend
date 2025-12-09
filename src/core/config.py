@@ -52,10 +52,11 @@ class Settings:
         
         self.pinecone_api_key = os.getenv("PINECONE_API_KEY", "")
         self.pinecone_index = os.getenv("PINECONE_INDEX", "")
+        self.pinecone_chat_index = os.getenv("PINECONE_CHAT_INDEX", "chat-session")
         self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "")
         self.pinecone_namespace = os.getenv("PINECONE_NAMESPACE", "")
         self.pinecone_configured = bool(
-            self.pinecone_api_key and self.pinecone_index
+            self.pinecone_api_key and self.pinecone_index and self.pinecone_chat_index
         )
         
         self.supabase_signed_url_ttl = int(os.getenv("SUPABASE_SIGNED_URL_TTL", "3600"))

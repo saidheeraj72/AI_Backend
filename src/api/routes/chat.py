@@ -21,7 +21,6 @@ from src.models.schemas import (
     RAGChatResponse,
 )
 from src.services.chat_history import ChatHistoryService
-from src.services.context_cache import ContextCacheService
 from src.services.llm import LLMService
 from src.services.metadata import MetadataService
 from src.services.pdf_processor import PDFProcessor
@@ -31,7 +30,6 @@ from src.services.websearch import WebSearchService
 from src.services.organization_service import OrganizationService
 from src.utils.paths import normalize_relative_path
 
-from src.services.session_store import SessionStoreService
 from langchain_core.documents import Document
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -60,8 +58,8 @@ chat_history_service = ChatHistoryService(settings, logger=logger)
 websearch_service = WebSearchService(settings.serper_api_key, logger=logger)
 org_service = OrganizationService(settings=settings, logger=logger)
 pdf_processor = PDFProcessor(logger=logger)
-context_cache_service = ContextCacheService(Path("data"), logger=logger)
-session_store = SessionStoreService(logger=logger)
+
+
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -151,10 +149,12 @@ async def chat(
 
     _ensure_user_access(current_user, user_id)
 
-    # Process uploaded documents (PDFs) and update session store
+    # Process uploaded documents (PDFs) and update Pinecone chat-session index
     if files:
         for file in files:
             if not file.filename.lower().endswith(".pdf"):
+                logger.warning(f"Skipping non-PDF file: {file.filename}")
+                await file.close()
                 continue  # Skip non-PDFs for now, or raise error
 
             with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -167,22 +167,17 @@ async def chat(
                 if doc and doc.page_content:
                     # Update metadata
                     doc.metadata["source"] = file.filename
+                    doc.metadata["user_id"] = user_id
+                    doc.metadata["chat_id"] = session_id
                     
-                    # Split into chunks
-                    chunks = await run_in_threadpool(
-                        vector_service.text_splitter.split_documents, [doc]
+                    # Index into Pinecone chat-session index
+                    chunks_indexed = await run_in_threadpool(
+                        vector_service.index_documents, 
+                        [doc], 
+                        pinecone_index_override=vector_service._pinecone_chat_index
                     )
-                    
-                    if chunks:
-                        texts = [chunk.page_content for chunk in chunks]
-                        # Generate embeddings
-                        embeddings = await run_in_threadpool(
-                            vector_service.embedding_model.embed_documents, texts
-                        )
-                        
-                        # Store in session memory
-                        session_store.add_documents(session_id, chunks, embeddings)
-
+                    if chunks_indexed == 0:
+                        logger.warning(f"No chunks indexed for file: {file.filename}")
             except HTTPException:
                 raise
             except Exception as e:
@@ -196,13 +191,18 @@ async def chat(
     # Construct the final prompt for the LLM
     llm_prompt_parts = []
     
-    # 1. Add cached context from session store (RAG)
+    # 1. Add cached context from Pinecone (RAG) for chat-specific documents
     if prompt:
         try:
-            query_vector = await run_in_threadpool(
-                vector_service.embedding_model.embed_query, prompt
+            # Search the chat-session Pinecone index
+            results = await run_in_threadpool(
+                vector_service.search,
+                query=prompt,
+                user_id=user_id,
+                chat_id=session_id,
+                top_k=5,
+                pinecone_index_override=vector_service._pinecone_chat_index,
             )
-            results = session_store.search(session_id, query_vector, top_k=5)
             
             if results:
                 context_parts = []
@@ -216,7 +216,7 @@ async def chat(
                     "Please use the above document content to answer the user's request."
                 )
         except Exception as e:
-            logger.error(f"Error retrieving session context: {e}")
+            logger.error(f"Error retrieving session context from Pinecone: {e}")
 
     # 2. Add websearch summary if applicable
     if websearch and prompt:
@@ -372,13 +372,25 @@ async def delete_chat_history(
             chat_id=chat_session_id,
             user_id=user_id,
         )
+        # Delete associated vectors from Pinecone chat-session index
+        vectors_removed = await run_in_threadpool(
+            vector_service.remove_by_chat_id,
+            chat_session_id,
+        )
+        logger.info(
+            "Deleted chat session %s for user %s. Removed %s chat history records and %s vectors.",
+            chat_session_id,
+            user_id,
+            deleted_count,
+            vectors_removed,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to delete chat session: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to delete chat session") from exc
 
-    return {"chat_id": chat_session_id, "deleted_messages": deleted_count}
+    return {"chat_id": chat_session_id, "deleted_messages": deleted_count, "deleted_vectors": vectors_removed}
 
 
 async def _handle_rag_chat(request: RAGChatRequest) -> RAGChatResponse:
