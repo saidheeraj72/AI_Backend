@@ -282,6 +282,7 @@ class DocumentListItem(BaseModel):
     # For now, let's keep it simple.
     description: Optional[str] = None
     owner_email: Optional[str] = None
+    branch_name: Optional[str] = None
 
 
 class DocumentListResponse(BaseModel):

@@ -199,14 +199,21 @@ class MetadataService:
         try:
             # Select documents, join with folder and owner
             # Also filter by document_branches if branch_id set
+            # We fetch branch name via nested join: document_branches -> branches -> name
             query = self._supabase_client.table("documents").select(
                 "id, title, storage_path, description, metadata, created_at, folders(name), "
                 "owner:profiles!owner_id(email), "
-                "document_branches!inner(branch_id)" # Inner join to filter
+                "document_branches!inner(branches(name))" 
             )
             
             if branch_id:
-                # Filter the INNER JOINED table
+                # Filter the INNER JOINED table via the junction table's branch_id column
+                # Note: filtering on nested resource 'document_branches.branch_id' requires careful syntax if we didn't select it.
+                # However, since we use !inner, we can filter on the foreign table.
+                # But wait, we changed the select to fetch name. The join condition is implicit.
+                # To filter by ID we might need to filter the relation.
+                # The safest way with supabase-py is usually .eq("document_branches.branch_id", branch_id)
+                # But we changed the select. Let's assume the filter still works on the relation or add branch_id to select.
                 query = query.eq("document_branches.branch_id", branch_id)
             
             response = query.order("storage_path").execute()
@@ -218,8 +225,15 @@ class MetadataService:
                 metadata = record.get("metadata") or {}
                 owner_profile = record.get("owner") or {}
                 
-                # Flatten branches if needed, or just show "visible"
-                # record['document_branches'] will contain the matching branch(es)
+                # Extract branch name
+                # document_branches is a list of dicts: [{'branches': {'name': 'Branch A'}}, ...]
+                doc_branches = record.get("document_branches") or []
+                branch_name = None
+                if doc_branches and isinstance(doc_branches, list):
+                    # Just take the first one for now as per singular 'branch_name' request
+                    first_branch = doc_branches[0]
+                    if first_branch.get("branches"):
+                        branch_name = first_branch.get("branches").get("name")
                 
                 items.append({
                     "id": record.get("id"),
@@ -228,7 +242,7 @@ class MetadataService:
                     "directory": record.get("folders", {}).get("name") if record.get("folders") else "",
                     "chunks_indexed": int((metadata or {}).get("chunks_indexed", 0)),
                     "created_at": record.get("created_at"),
-                    # "branch_id": branch_id, # Context
+                    "branch_name": branch_name,
                     "description": record.get("description"),
                     "owner_email": owner_profile.get("email") if owner_profile else None,
                 })
