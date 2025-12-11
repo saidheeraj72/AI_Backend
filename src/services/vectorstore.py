@@ -10,8 +10,25 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from langchain_core.documents import Document
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+import openai
 from src.core.config import Settings
+
+class OpenAIEmbeddingModel:
+    def __init__(self, model_name: str, api_key: str):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.model_name = model_name
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        response = self.client.embeddings.create(input=texts, model=self.model_name)
+        return [embedding.embedding for embedding in response.data]
+
+    def embed_query(self, text: str) -> list[float]:
+        if not text:
+            return []
+        response = self.client.embeddings.create(input=[text], model=self.model_name)
+        return response.data[0].embedding
 
 
 class VectorStoreService:
@@ -20,14 +37,10 @@ class VectorStoreService:
     def __init__(self, settings: Settings, *, logger: Optional[logging.Logger] = None) -> None:
         self.settings = settings
         self.logger = logger or logging.getLogger(__name__)
-        self.embedding_model = HuggingFaceBgeEmbeddings(
+        self.embedding_model = OpenAIEmbeddingModel(
             model_name=self.settings.embedding_model_name,
-            model_kwargs={"device": self.settings.embedding_model_device},
-            encode_kwargs={"normalize_embeddings": True},
-            query_instruction=self.settings.embedding_query_instruction,
+            api_key=self.settings.openai_api_key,
         )
-        # The query instruction must also be set on the instance for backward compatibility.
-        self.embedding_model.query_instruction = self.settings.embedding_query_instruction
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap,
@@ -195,17 +208,21 @@ class VectorStoreService:
             return 0
 
         namespace = self._pinecone_namespace or None
-        try:
-            pinecone_index.upsert(vectors=payloads, namespace=namespace)
-            self.logger.info(
-                "Upserted %s vectors to Pinecone",
-                len(payloads),
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self.logger.exception("Failed to upsert vectors to Pinecone: %s", exc)
-            raise
+        batch_size = 100
+        total_upserted = 0
 
-        return len(payloads)
+        for i in range(0, len(payloads), batch_size):
+            batch = payloads[i : i + batch_size]
+            try:
+                pinecone_index.upsert(vectors=batch, namespace=namespace)
+                total_upserted += len(batch)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.exception("Failed to upsert batch %d to Pinecone: %s", i, exc)
+                raise
+        
+        self.logger.info("Upserted %d vectors to Pinecone", total_upserted)
+
+        return total_upserted
 
     def _search_pinecone(
         self,
