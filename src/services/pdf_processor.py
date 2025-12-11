@@ -29,13 +29,32 @@ class PDFProcessor:
         return text
 
     def extract_tables(self, pdf_path: Path) -> str:
-        """Extract tables from a PDF file using Camelot."""
+        """Extract tables from a PDF file using Camelot in batches."""
         table_text = ""
         try:
-            tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
-            for index, table in enumerate(tables, start=1):
-                table_text += f"\n\nTable {index}:\n{table.df.to_string()}"
-            self.logger.info("Extracted %s tables from %s", len(tables), pdf_path.name)
+            # Get total pages first
+            with pdf_path.open("rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                num_pages = len(reader.pages)
+
+            # Process in chunks of 10 pages to save memory
+            batch_size = 10
+            total_tables = 0
+
+            for start in range(1, num_pages + 1, batch_size):
+                end = min(start + batch_size - 1, num_pages)
+                pages_range = f"{start}-{end}"
+                
+                try:
+                    tables = camelot.read_pdf(str(pdf_path), pages=pages_range, flavor="lattice")
+                    for _, table in enumerate(tables):
+                        total_tables += 1
+                        table_text += f"\n\nTable {total_tables}:\n{table.df.to_string()}"
+                except Exception as batch_exc:
+                    self.logger.warning("Table extraction failed for pages %s in %s: %s", pages_range, pdf_path.name, batch_exc)
+                    continue
+
+            self.logger.info("Extracted %s tables from %s", total_tables, pdf_path.name)
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.warning("Table extraction skipped for %s: %s", pdf_path.name, exc)
         return table_text
