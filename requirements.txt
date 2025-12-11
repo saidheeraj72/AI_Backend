@@ -9,11 +9,9 @@ supabase
 langchain
 langchain-groq
 langchain-community
-langchain-huggingface
+openai
 pinecone
-FlagEmbedding
 pdfplumber
 camelot-py[cv]
 numpy
 PyPDF2
-mangum
