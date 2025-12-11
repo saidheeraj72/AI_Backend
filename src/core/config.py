@@ -83,6 +83,7 @@ class Settings:
                 "http://localhost:5173",
                 "http://localhost:5174",
                 "https://www.shreembo.com", # Added by Gemini CLI
+                "https://shreembo.com", # Added by Gemini CLI
                 "https://smart-biz-desk.saidheeraj987.workers.dev", # Added by Gemini CLI
             ]
         
