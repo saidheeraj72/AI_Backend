@@ -56,10 +56,25 @@ class StorageService:
         )
         content_type = upload.content_type or "application/pdf"
 
-        if self._supabase_enabled:
-            file_bytes = await upload.read()
+        # Always stream to a temporary file first to avoid memory issues
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_path = Path(temp_file.name)
+
+        try:
+            with temp_file:
+                while True:
+                    chunk = await upload.read(1024 * 1024)  # Read 1MB chunks
+                    if not chunk:
+                        break
+                    temp_file.write(chunk)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+        finally:
             await upload.close()
-            temp_path = self._write_temp_file(file_bytes)
+
+        if self._supabase_enabled:
             if await self._upload_to_supabase_async(
                 temp_path, target_relative, mimetype=content_type
             ):
@@ -86,21 +101,20 @@ class StorageService:
                 should_cleanup=False,
             )
 
+        # Local storage logic (when Supabase is disabled)
         target_path = self._prepare_target_path(target_relative)
+        await asyncio.to_thread(shutil.copyfile, temp_path, target_path)
+        self.cleanup_local_path(temp_path)
+        
         final_relative = target_path.relative_to(self.base_dir)
-
-        with target_path.open("wb") as destination:
-            while True:
-                chunk = await upload.read(1_048_576)
-                if not chunk:
-                    break
-                destination.write(chunk)
-        await upload.close()
-
         self.logger.info("Stored upload as %s", final_relative)
+        
+        # Attempt upload to Supabase (this will likely do nothing if _supabase_enabled is False,
+        # but keeps existing side-effect logic if it was intended for some edge case)
         await self._upload_to_supabase_async(
             target_path, final_relative, mimetype=content_type
         )
+        
         return StoredDocument(
             relative_path=final_relative,
             local_path=target_path,

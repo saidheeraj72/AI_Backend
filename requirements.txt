@@ -15,4 +15,5 @@ pdfplumber
 camelot-py[cv]
 numpy
 PyPDF2
-'pydantic[email]'
+'pydantic[email]'pytest
+pytest-asyncio
