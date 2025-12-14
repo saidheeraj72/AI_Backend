@@ -33,6 +33,8 @@ class NoValidDocumentsError(DocumentIngestorError):
         self.failures = failures
 
 
+from src.services.socket_manager import manager
+
 class DocumentIngestor:
     """Coordinate PDF ingestion from uploads into storage, metadata, and vector store."""
 
@@ -52,6 +54,99 @@ class DocumentIngestor:
         self.vector_service = vector_service
         self.metadata_service = metadata_service
         self.logger = logger
+
+    async def ingest_paths_background(
+        self,
+        paths: List[str],
+        branch_ids: List[str],
+        branch_name: str | None = None,
+        *,
+        org_id: str | None = None,
+        created_by: str | None = None,
+        description: str | None = None,
+        user_id: str | None = None,
+        chat_id: str | None = None,
+    ) -> None:
+        """
+        Background task to ingest files and broadcast progress via WebSocket.
+        """
+        if not user_id:
+            self.logger.warning("No user_id provided for background ingestion; cannot send notifications.")
+            return
+
+        for path_str in paths:
+            filename = Path(path_str).name
+            await manager.send_personal_message(json.dumps({"type": "start", "file": filename}), user_id)
+            
+            local_path = None
+            try:
+                # 1. Download/Prepare File
+                await manager.send_personal_message(json.dumps({"type": "progress", "file": filename, "step": "downloading", "message": "Retrieving file..."}), user_id)
+                
+                local_path = await asyncio.to_thread(self.storage_service.download_to_temp, path_str)
+                relative_path = Path(path_str)
+
+                # 2. Process PDF (Extract Text)
+                await manager.send_personal_message(json.dumps({"type": "progress", "file": filename, "step": "processing", "message": "Extracting text..."}), user_id)
+                document = await asyncio.to_thread(self.pdf_processor.process_pdf, local_path)
+                
+                if document is None:
+                    await manager.send_personal_message(json.dumps({"type": "error", "file": filename, "error": "Could not extract content"}), user_id)
+                    self.storage_service.cleanup_local_path(local_path, allow_dir_cleanup=False)
+                    continue
+
+                document.metadata["source"] = relative_path.as_posix()
+                if user_id:
+                    document.metadata["user_id"] = user_id
+                if chat_id:
+                    document.metadata["chat_id"] = chat_id
+
+                pinecone_index_to_use = None
+                if chat_id:
+                    pinecone_index_to_use = self.vector_service._pinecone_chat_index
+
+                # 3. Index Vectors
+                await manager.send_personal_message(json.dumps({"type": "progress", "file": filename, "step": "indexing", "message": "Generating embeddings..."}), user_id)
+                chunks_indexed = await asyncio.to_thread(
+                    self.vector_service.index_documents, 
+                    [document], 
+                    pinecone_index_override=pinecone_index_to_use
+                )
+                
+                if chunks_indexed == 0:
+                    await manager.send_personal_message(json.dumps({"type": "error", "file": filename, "error": "No content indexed"}), user_id)
+                    self.storage_service.cleanup_local_path(local_path, allow_dir_cleanup=False)
+                    continue
+
+                # 4. Metadata Record
+                await manager.send_personal_message(json.dumps({"type": "progress", "file": filename, "step": "recording", "message": "Saving metadata..."}), user_id)
+                await asyncio.to_thread(
+                    self.metadata_service.record_document,
+                    relative_path,
+                    chunks_indexed,
+                    branch_ids=branch_ids,
+                    branch_name=branch_name,
+                    org_id=org_id,
+                    created_by=created_by,
+                    description=description,
+                )
+
+                # 5. Success
+                result = {
+                    "filename": relative_path.name,
+                    "relative_path": relative_path.as_posix(),
+                    "chunks_indexed": chunks_indexed,
+                    "branch_ids": branch_ids
+                }
+                await manager.send_personal_message(json.dumps({"type": "complete", "file": filename, "result": result}), user_id)
+                
+                self.storage_service.cleanup_local_path(local_path, allow_dir_cleanup=False)
+
+            except Exception as e:
+                self.logger.exception("Error processing file path %s", path_str)
+                await manager.send_personal_message(json.dumps({"type": "error", "file": filename, "error": str(e)}), user_id)
+                if local_path:
+                    self.storage_service.cleanup_local_path(local_path, allow_dir_cleanup=False)
 
     async def ingest_uploads_stream(
         self,

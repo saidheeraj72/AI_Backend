@@ -11,6 +11,7 @@ from src.api.routes.config import router as config_router
 from src.api.routes.documents import router as documents_router
 from src.api.routes.settings import router as settings_router
 from src.api.routes.team_profiles import router as team_profiles_router
+from src.api.routes.notifications import router as notifications_router
 from src.core.config import get_settings
 
 settings = get_settings()
@@ -55,6 +56,7 @@ def create_app() -> FastAPI:
     application.include_router(config_router)
     application.include_router(settings_router)
     application.include_router(team_profiles_router)
+    application.include_router(notifications_router)
 
     @application.get("/health")
     async def health_check() -> dict[str, str]:

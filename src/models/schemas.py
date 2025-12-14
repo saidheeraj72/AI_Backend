@@ -372,3 +372,14 @@ class DocumentSearchRequest(BaseModel):
 class DocumentSearchResponse(BaseModel):
     documents: List[DocumentListItem] = Field(default_factory=list)
     total_count: int = Field(description="Total number of matching documents")
+
+class BatchProcessRequest(BaseModel):
+    paths: List[str]
+    branch_ids: List[str]
+    description: Optional[str] = None
+    chat_id: Optional[str] = None
+
+class UploadUrlResponse(BaseModel):
+    upload_url: str
+    relative_path: str
+    token: Optional[str] = None

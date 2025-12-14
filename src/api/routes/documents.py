@@ -7,7 +7,7 @@ from pathlib import Path
 from functools import partial
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 
@@ -21,6 +21,8 @@ from src.models.schemas import (
     DocumentSearchResponse,
     Folder,
     FolderCreate,
+    BatchProcessRequest,
+    UploadUrlResponse,
 )
 from src.services.document_ingestor import DocumentIngestor, NoValidDocumentsError
 from src.services.metadata import MetadataService
@@ -87,6 +89,35 @@ async def create_folder(
         raise HTTPException(status_code=400, detail="Failed to create folder")
         
     return Folder(**result)
+
+@router.post("/process-batch", status_code=202)
+async def process_batch_upload(
+    request: BatchProcessRequest,
+    background_tasks: BackgroundTasks,
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, str]:
+    """
+    Process a batch of documents that have already been uploaded to storage.
+    Processing happens in the background; updates are sent via WebSocket.
+    """
+    if not request.paths:
+        raise HTTPException(status_code=400, detail="No paths provided")
+    if not request.branch_ids:
+        raise HTTPException(status_code=400, detail="At least one branch ID is required")
+
+    background_tasks.add_task(
+        document_ingestor.ingest_paths_background,
+        request.paths,
+        branch_ids=request.branch_ids,
+        branch_name=None,
+        org_id=None,
+        created_by=current_user.id,
+        description=request.description,
+        user_id=current_user.id,
+        chat_id=request.chat_id,
+    )
+    
+    return {"message": "Processing started", "status": "queued"}
 
 @router.post("/upload")
 async def upload_document(
