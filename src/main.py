@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.config import dictConfig
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from src.api.routes.chat import rag_router, router as chat_router
 from src.api.routes.config import router as config_router
@@ -61,6 +64,29 @@ def create_app() -> FastAPI:
     @application.get("/health")
     async def health_check() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Serve React App
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dist_dir = os.path.join(base_dir, "smart-biz-desk", "dist")
+
+    if os.path.exists(dist_dir):
+        # Mount assets if the directory exists
+        assets_dir = os.path.join(dist_dir, "assets")
+        if os.path.isdir(assets_dir):
+            application.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+        @application.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            # Check if file exists in dist
+            file_path = os.path.join(dist_dir, full_path)
+            if os.path.isfile(file_path):
+                return FileResponse(file_path)
+            
+            # Fallback to index.html for SPA routing
+            return FileResponse(os.path.join(dist_dir, "index.html"))
+    else:
+        # Use root logger as specific logger might not be configured for this scope or rely on existing setup
+        logging.getLogger("uvicorn").warning(f"Frontend dist directory not found at {dist_dir}. SPA serving disabled.")
 
     return application
 
