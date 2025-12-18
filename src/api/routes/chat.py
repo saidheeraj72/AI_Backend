@@ -178,7 +178,7 @@ async def chat(
                         table_content = ""
                         
                         if num_pages > 0:
-                            batch_size = 5
+                            batch_size = 10
                             for start in range(1, num_pages + 1, batch_size):
                                 end = min(start + batch_size - 1, num_pages)
                                 pages_range = f"{start}-{end}"
