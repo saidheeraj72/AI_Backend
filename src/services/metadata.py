@@ -201,7 +201,7 @@ class MetadataService:
             # Also filter by document_branches if branch_id set
             # We fetch branch name via nested join: document_branches -> branches -> name
             query = self._supabase_client.table("documents").select(
-                "id, title, storage_path, description, metadata, created_at, folders(name), "
+                "id, title, storage_path, description, metadata, created_at, folder_id, folders(name), "
                 "owner:profiles!owner_id(email), "
                 "document_branches!inner(branches(name))" 
             )
@@ -237,6 +237,7 @@ class MetadataService:
                 
                 items.append({
                     "id": record.get("id"),
+                    "folder_id": record.get("folder_id"),
                     "filename": record.get("title"),
                     "relative_path": storage_path,
                     "directory": record.get("folders", {}).get("name") if record.get("folders") else "",
@@ -249,6 +250,26 @@ class MetadataService:
             return items
         except Exception as exc:
             self.logger.error("Failed to list documents: %s", exc)
+            return []
+
+    def list_folders(self, branch_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Lists folders.
+        If branch_id is provided, filters by availability in that branch.
+        """
+        if not self._supabase_client:
+            return []
+            
+        try:
+            query = self._supabase_client.table("folders").select("id, parent_id, name, description, created_at, updated_at, folder_branches!inner(branch_id)")
+            
+            if branch_id:
+                query = query.eq("folder_branches.branch_id", branch_id)
+            
+            response = query.order("name").execute()
+            return response.data or []
+        except Exception as exc:
+            self.logger.error("Failed to list folders: %s", exc)
             return []
 
     def get_document_by_id(self, document_id: str, *, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
