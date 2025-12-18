@@ -169,8 +169,33 @@ async def chat(
                         tmp_path = Path(tmp.name)
                     
                     try:
-                        doc = await run_in_threadpool(pdf_processor.process_pdf, tmp_path)
-                        if doc and doc.page_content:
+                        # 1. Extract Text
+                        yield json.dumps({"type": "status", "message": f"Extracting text from {file.filename}..."}) + "\n"
+                        text_content = await run_in_threadpool(pdf_processor.extract_text, tmp_path)
+                        
+                        # 2. Extract Tables (with progress)
+                        num_pages = await run_in_threadpool(pdf_processor.get_page_count, tmp_path)
+                        table_content = ""
+                        
+                        if num_pages > 0:
+                            batch_size = 5
+                            for start in range(1, num_pages + 1, batch_size):
+                                end = min(start + batch_size - 1, num_pages)
+                                pages_range = f"{start}-{end}"
+                                
+                                yield json.dumps({"type": "status", "message": f"Analyzing tables ({start}-{end}/{num_pages})..."}) + "\n"
+                                
+                                chunk_table = await run_in_threadpool(
+                                    pdf_processor.extract_tables_batch, 
+                                    tmp_path, 
+                                    pages_range
+                                )
+                                table_content += chunk_table
+
+                        combined_content = f"{text_content}{table_content}".strip()
+                        
+                        if combined_content:
+                            doc = Document(page_content=combined_content)
                             doc.metadata["source"] = file.filename
                             doc.metadata["user_id"] = user_id
                             doc.metadata["chat_id"] = session_id
@@ -182,8 +207,12 @@ async def chat(
                                 [doc], 
                                 pinecone_index_override=vector_service._pinecone_chat_index
                             )
+                        else:
+                             logger.warning(f"No content extracted from {file.filename}")
+
                     except Exception as e:
                         logger.error(f"Error processing file {file.filename}: {e}")
+                        yield json.dumps({"type": "status", "message": f"Error processing {file.filename}: {str(e)}"}) + "\n"
                     finally:
                         if tmp_path.exists():
                             tmp_path.unlink()
