@@ -194,6 +194,7 @@ class Folder(BaseModel):
 class FolderCreate(BaseModel):
     branch_ids: List[UUID]
     parent_id: Optional[UUID] = None
+    parent_path: Optional[str] = None
     name: str
     description: Optional[str] = None
 
@@ -272,6 +273,7 @@ class DocumentUploadError(BaseModel):
 
 class DocumentListItem(BaseModel):
     id: Optional[UUID] = None
+    folder_id: Optional[UUID] = None
     filename: str
     relative_path: str
     directory: str
@@ -284,9 +286,18 @@ class DocumentListItem(BaseModel):
     owner_email: Optional[str] = None
     branch_name: Optional[str] = None
 
+class FolderResponse(BaseModel):
+    id: UUID
+    parent_id: Optional[UUID] = None
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    branch_ids: Optional[List[UUID]] = None
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentListItem] = Field(default_factory=list)
+
 
 
 class DocumentIngestResponse(BaseModel):

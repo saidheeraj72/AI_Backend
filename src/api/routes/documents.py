@@ -21,6 +21,7 @@ from src.models.schemas import (
     DocumentSearchResponse,
     Folder,
     FolderCreate,
+    FolderResponse,
     BatchProcessRequest,
     UploadUrlResponse,
 )
@@ -66,6 +67,32 @@ document_ingestor = DocumentIngestor(
 )
 org_service = OrganizationService(settings=settings, logger=logger)
 
+@router.get("/folders", response_model=List[FolderResponse])
+async def list_folders(
+    branch_id: str | None = Query(default=None, description="Filter by branch context"),
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> List[FolderResponse]:
+    """
+    List folders for a given branch.
+    """
+    raw_folders = metadata_service.list_folders(branch_id=branch_id)
+    folders = []
+    for f in raw_folders:
+        # Extract branch_ids from nested structure
+        # f['folder_branches'] is list of dicts [{'branch_id': '...'}, ...]
+        branch_ids = [b['branch_id'] for b in f.get('folder_branches', [])]
+        
+        folders.append(FolderResponse(
+            id=f['id'],
+            parent_id=f.get('parent_id'),
+            name=f['name'],
+            description=f.get('description'),
+            created_at=f['created_at'],
+            updated_at=f['updated_at'],
+            branch_ids=branch_ids
+        ))
+    return folders
+
 @router.post("/folders", response_model=Folder)
 async def create_folder(
     folder: FolderCreate,
@@ -77,10 +104,22 @@ async def create_folder(
     if not folder.branch_ids:
          raise HTTPException(status_code=400, detail="At least one branch_id is required")
     
+    parent_id = str(folder.parent_id) if folder.parent_id else None
+    branch_ids_str = [str(bid) for bid in folder.branch_ids]
+
+    if not parent_id and folder.parent_path:
+        # Resolve parent path to ID
+        parent_id = metadata_service._get_folder_id_by_path(
+            branch_ids=branch_ids_str,
+            path=folder.parent_path,
+            create=True,
+            created_by=current_user.id
+        )
+
     result = metadata_service.create_folder(
-        branch_ids=[str(bid) for bid in folder.branch_ids],
+        branch_ids=branch_ids_str,
         name=folder.name,
-        parent_id=str(folder.parent_id) if folder.parent_id else None,
+        parent_id=parent_id,
         description=folder.description,
         created_by=current_user.id
     )
