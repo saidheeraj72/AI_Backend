@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Optional, Sequence, Union
@@ -9,6 +10,7 @@ from uuid import uuid4, UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 
 from src.api.dependencies.auth import SupabaseUser, require_supabase_user
 from src.core.config import get_settings
@@ -21,7 +23,7 @@ from src.models.schemas import (
     RAGChatResponse,
 )
 from src.services.chat_history import ChatHistoryService
-from src.services.llm import LLMService
+from src.services.llm import LLMService, LLM_MODELS
 from src.services.metadata import MetadataService
 from src.services.pdf_processor import PDFProcessor
 from src.services.rag import RAGChatService
@@ -119,7 +121,7 @@ def _collect_accessible_documents(user_id: str) -> list[dict[str, Any]]:
     return accessible
 
 
-@router.post("", response_model=ChatResponse)
+@router.post("", response_class=StreamingResponse)
 async def chat(
     model_key: str = Form(...),
     prompt: Optional[str] = Form(None),
@@ -129,173 +131,190 @@ async def chat(
     files: Optional[list[UploadFile]] = File(None),
     websearch: bool = Form(False),
     current_user: SupabaseUser = Depends(require_supabase_user),
-) -> ChatResponse:
+) -> StreamingResponse:
+    # Validate user access immediately
+    _ensure_user_access(current_user, user_id)
+
+    # Process image if present
     image_bytes: Optional[bytes] = None
     image_mime: Optional[str] = None
-
     if image is not None:
         image_mime = image.content_type or ""
         if image_mime not in ALLOWED_IMAGE_TYPES:
             await image.close()
             raise HTTPException(status_code=400, detail="Unsupported image type")
-
         image_bytes = await image.read()
         await image.close()
 
     session_id = chat_session_id or str(uuid4())
-
     if websearch and not prompt:
         raise HTTPException(status_code=400, detail="websearch requires a text prompt")
 
-    _ensure_user_access(current_user, user_id)
-
-    # Process uploaded documents (PDFs) and update Pinecone chat-session index
-    if files:
-        for file in files:
-            if not file.filename.lower().endswith(".pdf"):
-                logger.warning(f"Skipping non-PDF file: {file.filename}")
-                await file.close()
-                continue  # Skip non-PDFs for now, or raise error
-
-            with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                shutil.copyfileobj(file.file, tmp)
-                tmp_path = Path(tmp.name)
-            
-            try:
-                # Run PDF processing in threadpool to avoid blocking event loop
-                doc = await run_in_threadpool(pdf_processor.process_pdf, tmp_path)
-                if doc and doc.page_content:
-                    # Update metadata
-                    doc.metadata["source"] = file.filename
-                    doc.metadata["user_id"] = user_id
-                    doc.metadata["chat_id"] = session_id
-                    
-                    # Index into Pinecone chat-session index
-                    chunks_indexed = await run_in_threadpool(
-                        vector_service.index_documents, 
-                        [doc], 
-                        pinecone_index_override=vector_service._pinecone_chat_index
-                    )
-                    if chunks_indexed == 0:
-                        logger.warning(f"No chunks indexed for file: {file.filename}")
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Error processing file {file.filename}: {e}")
-                # Optionally raise error or just skip
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-                await file.close()
-
-    # Construct the final prompt for the LLM
-    llm_prompt_parts = []
-    
-    # 1. Add cached context from Pinecone (RAG) for chat-specific documents
-    if prompt:
+    async def event_stream():
         try:
-            # Search the chat-session Pinecone index
-            results = await run_in_threadpool(
-                vector_service.search,
-                query=prompt,
-                user_id=user_id,
-                chat_id=session_id,
-                top_k=5,
-                pinecone_index_override=vector_service._pinecone_chat_index,
-            )
-            
-            if results:
-                context_parts = []
-                for doc, score in results:
-                    source_name = doc.metadata.get('source', 'uploaded document')
-                    context_parts.append(f"Source: {source_name}\nContent: {doc.page_content}")
+            yield json.dumps({"type": "status", "message": "Initializing chat..."}) + "\n"
+
+            # 1. Process uploaded documents
+            if files:
+                yield json.dumps({"type": "status", "message": f"Processing {len(files)} uploaded file(s)..."}) + "\n"
                 
-                cached_context = "\n\n".join(context_parts)
-                llm_prompt_parts.append(
-                    f"Here is the content of the uploaded documents for this session (retrieved via RAG):\n{cached_context}\n"
-                    "Please use the above document content to answer the user's request."
+                for file in files:
+                    if not file.filename.lower().endswith(".pdf"):
+                        continue
+                    
+                    yield json.dumps({"type": "status", "message": f"Reading {file.filename}..."}) + "\n"
+                    
+                    with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        shutil.copyfileobj(file.file, tmp)
+                        tmp_path = Path(tmp.name)
+                    
+                    try:
+                        doc = await run_in_threadpool(pdf_processor.process_pdf, tmp_path)
+                        if doc and doc.page_content:
+                            doc.metadata["source"] = file.filename
+                            doc.metadata["user_id"] = user_id
+                            doc.metadata["chat_id"] = session_id
+                            
+                            yield json.dumps({"type": "status", "message": f"Indexing {file.filename}..."}) + "\n"
+                            
+                            await run_in_threadpool(
+                                vector_service.index_documents, 
+                                [doc], 
+                                pinecone_index_override=vector_service._pinecone_chat_index
+                            )
+                    except Exception as e:
+                        logger.error(f"Error processing file {file.filename}: {e}")
+                    finally:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                        await file.close()
+
+            # 2. Build Prompt (RAG / Websearch)
+            llm_prompt_parts = []
+            
+            if prompt:
+                yield json.dumps({"type": "status", "message": "Retrieving context..."}) + "\n"
+                try:
+                    results = await run_in_threadpool(
+                        vector_service.search,
+                        query=prompt,
+                        user_id=user_id,
+                        chat_id=session_id,
+                        top_k=5,
+                        pinecone_index_override=vector_service._pinecone_chat_index,
+                    )
+                    
+                    if results:
+                        context_parts = []
+                        for doc, score in results:
+                            source_name = doc.metadata.get('source', 'uploaded document')
+                            context_parts.append(f"Source: {source_name}\nContent: {doc.page_content}")
+                        
+                        cached_context = "\n\n".join(context_parts)
+                        llm_prompt_parts.append(
+                            f"Here is the content of the uploaded documents for this session (retrieved via RAG):\n{cached_context}\n"
+                            "Please use the above document content to answer the user's request."
+                        )
+                except Exception as e:
+                    logger.error(f"Error retrieving session context: {e}")
+
+            if websearch and prompt:
+                yield json.dumps({"type": "status", "message": "Searching the web..."}) + "\n"
+                try:
+                    search_summary = await run_in_threadpool(
+                        websearch_service.search_and_summarize,
+                        prompt,
+                    )
+                    if search_summary:
+                        llm_prompt_parts.append(
+                            f"Use the following web search summary to answer the question.\n{search_summary}"
+                        )
+                except Exception as e:
+                    logger.error(f"Web search failed: {e}")
+
+            if prompt:
+                llm_prompt_parts.append(prompt)
+            
+            final_prompt = "\n\n".join(llm_prompt_parts).strip()
+            if not final_prompt and not image_bytes:
+                 yield json.dumps({"type": "error", "message": "Prompt or image is required"}) + "\n"
+                 return
+
+            # 3. Fetch History
+            history_records = []
+            try:
+                history_records = await run_in_threadpool(
+                    chat_history_service.get_chat_history,
+                    chat_id=session_id,
+                    user_id=user_id,
                 )
+            except Exception as e:
+                logger.error(f"Failed to fetch history: {e}")
+
+            llm_history = []
+            for record in history_records:
+                if record.get("user_input"):
+                    llm_history.append({"role": "user", "content": record["user_input"]})
+                if record.get("response"):
+                    llm_history.append({"role": "assistant", "content": record["response"]})
+
+            # 4. Stream LLM Response
+            yield json.dumps({"type": "status", "message": "Generating response..."}) + "\n"
+            
+            full_response = ""
+            try:
+                # Use the new streaming method
+                stream_generator = llm_service.stream_chat(
+                    model_key,
+                    prompt=final_prompt,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime,
+                    history=llm_history,
+                )
+                
+                for chunk in stream_generator:
+                    full_response += chunk
+                    yield json.dumps({"type": "content", "delta": chunk}) + "\n"
+
+            except Exception as e:
+                logger.exception("Chat generation failed: %s", e)
+                yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+                return
+
+            # 5. Save History
+            yield json.dumps({"type": "status", "message": "Finalizing..."}) + "\n"
+            try:
+                await run_in_threadpool(
+                    chat_history_service.save_chat,
+                    chat_id=session_id,
+                    user_id=user_id,
+                    model_key=model_key,
+                    model_name=LLM_MODELS.get(model_key, {}).get("name", "Unknown"),
+                    user_input=prompt,
+                    response=full_response,
+                    usage=None, # Usage is harder to get in stream, maybe estimate or skip
+                    has_image=image_bytes is not None,
+                    image_mime_type=image_mime,
+                    interaction_type="standard",
+                    org_id=None, 
+                )
+            except Exception as e:
+                logger.error(f"Failed to save history: {e}")
+
+            # 6. Final Result
+            yield json.dumps({
+                "type": "result",
+                "chat_id": session_id,
+                "model_key": model_key,
+                "response": full_response,
+                "sources": [] # Standard chat usually doesn't return structured sources like RAG
+            }) + "\n"
+
         except Exception as e:
-            logger.error(f"Error retrieving session context from Pinecone: {e}")
+            logger.exception("Unexpected error in chat stream")
+            yield json.dumps({"type": "error", "message": f"Unexpected error: {str(e)}"}) + "\n"
 
-    # 2. Add websearch summary if applicable
-    if websearch and prompt:
-        try:
-            search_summary = await run_in_threadpool(
-                websearch_service.search_and_summarize,
-                prompt,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception("Web search failed: %s", exc)
-            search_summary = None
-
-        if search_summary:
-            llm_prompt_parts.append(
-                f"Use the following web search summary to answer the question.\n{search_summary}"
-            )
-
-    # 3. Add user prompt
-    if prompt:
-        llm_prompt_parts.append(prompt)
-    
-    final_prompt = "\n\n".join(llm_prompt_parts).strip()
-
-    if not final_prompt and not image_bytes:
-        raise HTTPException(status_code=400, detail="Prompt or image is required")
-
-    # Fetch and format chat history
-    history_records = []
-    try:
-        history_records = await run_in_threadpool(
-            chat_history_service.get_chat_history,
-            chat_id=session_id,
-            user_id=user_id,
-        )
-    except Exception as e:
-        logger.error(f"Failed to fetch history: {e}")
-
-    llm_history = []
-    for record in history_records:
-        if record.get("user_input"):
-            llm_history.append({"role": "user", "content": record["user_input"]})
-        if record.get("response"):
-            llm_history.append({"role": "assistant", "content": record["response"]})
-
-    try:
-        result = await run_in_threadpool(
-            llm_service.chat,
-            model_key,
-            prompt=final_prompt,
-            image_bytes=image_bytes,
-            image_mime_type=image_mime,
-            history=llm_history,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Chat completion failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Failed to generate response") from exc
-
-    await run_in_threadpool(
-        chat_history_service.save_chat,
-        chat_id=session_id,
-        user_id=user_id,
-        model_key=model_key,
-        model_name=result.get("model_name", ""),
-        user_input=prompt, # Save original user input, not the context-heavy prompt
-        response=result.get("response", ""),
-        usage=result.get("usage"),
-        has_image=image_bytes is not None,
-        image_mime_type=image_mime,
-        interaction_type="standard",
-        org_id=None, 
-    )
-
-    result["chat_id"] = session_id
-
-    return ChatResponse(**result)
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @router.get(

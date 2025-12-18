@@ -131,3 +131,30 @@ class LLMService:
             "response": content,
             "usage": usage_data,
         }
+
+    def stream_chat(
+        self,
+        model_key: str,
+        *,
+        prompt: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
+        image_mime_type: Optional[str] = None,
+        history: Optional[list[dict[str, Any]]] = None,
+    ):
+        model_info = LLM_MODELS.get(model_key)
+        if model_info is None:
+            raise ValueError(f"Unknown model key: {model_key}")
+
+        messages = self._build_messages(model_key, prompt, image_bytes, image_mime_type, history)
+
+        self.logger.info("Sending streaming chat request to model %s", model_info["model"])
+        stream = self.client.chat.completions.create(
+            model=model_info["model"],
+            messages=messages,
+            stream=True,
+        )
+
+        for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
