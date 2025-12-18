@@ -85,6 +85,7 @@ class Settings:
                 "https://www.shreembo.com", # Added by Gemini CLI
                 "https://shreembo.com", # Added by Gemini CLI
                 "https://smart-biz-desk.saidheeraj987.workers.dev", # Added by Gemini CLI
+                "https://smart-biz-desk-dev.pages.dev",
             ]
         
         # Add ngrok domains dynamically
