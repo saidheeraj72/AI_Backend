@@ -188,7 +188,7 @@ class MetadataService:
         except Exception as exc:
             self.logger.error("Failed to upsert Supabase metadata for %s: %s", storage_path, exc)
 
-    def list_documents(self, *, org_id: Optional[str] = None, branch_id: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_documents(self, *, org_id: Optional[str] = None, branch_id: Optional[str] = None, status: Optional[str] = None, folder_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Lists documents.
         If branch_id is provided, filters by availability in that branch.
@@ -215,6 +215,9 @@ class MetadataService:
                 # The safest way with supabase-py is usually .eq("document_branches.branch_id", branch_id)
                 # But we changed the select. Let's assume the filter still works on the relation or add branch_id to select.
                 query = query.eq("document_branches.branch_id", branch_id)
+            
+            if folder_ids:
+                query = query.in_("folder_id", folder_ids)
             
             response = query.order("storage_path").execute()
             
@@ -298,6 +301,21 @@ class MetadataService:
             return True
         except Exception as exc:
             self.logger.error("Failed to delete document: %s", exc)
+            return False
+
+    def delete_folder(self, folder_id: str) -> bool:
+        """
+        Deletes a folder by ID. 
+        Note: This does NOT recursively delete documents/subfolders if FK constraints don't cascade.
+        It is expected that the caller cleans up contents first.
+        """
+        if not self._supabase_client:
+            return False
+        try:
+            self._supabase_client.table("folders").delete().eq("id", folder_id).execute()
+            return True
+        except Exception as exc:
+            self.logger.error("Failed to delete folder %s: %s", folder_id, exc)
             return False
 
     def create_folder(self, branch_ids: List[str], name: str, parent_id: Optional[str] = None, description: Optional[str] = None, created_by: Optional[str] = None) -> Optional[Dict[str, Any]]:

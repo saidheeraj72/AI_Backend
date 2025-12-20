@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import zipfile
 import json
+import asyncio
 from io import BytesIO
 from pathlib import Path
 from typing import List, Sequence, Tuple, AsyncGenerator

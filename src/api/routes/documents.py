@@ -158,6 +158,83 @@ async def process_batch_upload(
     
     return {"message": "Processing started", "status": "queued"}
 
+@router.post("/upload-async")
+async def upload_document_async(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] | None = File(default=None),
+    file: UploadFile | None = File(default=None),
+    relative_paths: list[str] | None = Form(default=None),
+    branch_ids: list[str] = Form(default=[]),
+    branch_name: str | None = Form(default=None),
+    description: str | None = Form(default=None),
+    chat_id: str | None = Form(default=None),
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, Any]:
+    """
+    Upload documents and process them in the background (Async + WebSocket).
+    Returns immediately with a queued status.
+    """
+    if not branch_ids:
+         raise HTTPException(status_code=400, detail="At least one branch ID is required")
+
+    uploads: list[UploadFile] = []
+    if files:
+        uploads.extend(files)
+    if file is not None:
+        uploads.append(file)
+
+    if not uploads:
+        raise HTTPException(status_code=400, detail="At least one file must be provided")
+
+    sanitized_paths: list[str] = []
+    if relative_paths is not None:
+        if len(relative_paths) != len(uploads):
+            raise HTTPException(
+                status_code=400,
+                detail="Number of relative_paths entries must match uploaded files",
+            )
+        for provided_path in relative_paths:
+            normalized = normalize_relative_path(provided_path)
+            sanitized_paths.append(normalized)
+
+        for upload, normalized in zip(uploads, sanitized_paths, strict=False):
+            if normalized:
+                upload.filename = normalized
+
+    # 1. Save all files first
+    saved_relative_paths = []
+    for upload in uploads:
+        try:
+            # We use relative_path=upload.filename which we might have just sanitized
+            stored = await storage_service.save_pdf(upload, relative_path=upload.filename)
+            saved_relative_paths.append(stored.relative_path.as_posix())
+        except Exception as e:
+            logger.error(f"Failed to save uploaded file {upload.filename}: {e}")
+            # If one fails, we continue with others? Or fail batch? 
+            # Let's fail hard if save fails, as client expects success.
+            # But wait, we might have saved some.
+            # For simplicity, if save fails, we raise 500.
+            raise HTTPException(status_code=500, detail=f"Failed to save file {upload.filename}: {str(e)}")
+
+    # 2. Enqueue Background Task
+    background_tasks.add_task(
+        document_ingestor.ingest_paths_background,
+        saved_relative_paths,
+        branch_ids=branch_ids,
+        branch_name=branch_name,
+        org_id=None,
+        created_by=current_user.id,
+        description=description,
+        user_id=current_user.id,
+        chat_id=chat_id,
+    )
+
+    return {
+        "status": "queued",
+        "message": f"Successfully uploaded {len(saved_relative_paths)} files. Processing started.",
+        "files": saved_relative_paths
+    }
+
 @router.post("/upload")
 async def upload_document(
     files: list[UploadFile] | None = File(default=None),
@@ -356,4 +433,67 @@ async def get_my_document_permissions(
         "has_full_access": is_admin_or_manager,
         "can_upload_role": is_admin_or_manager or any(p.get("can_upload") for p in perms.values()),
         "document_permissions": perms
+    }
+
+@router.delete("/folders/{folder_id}", response_model=dict[str, Any])
+async def delete_folder_endpoint(
+    folder_id: str,
+    current_user: SupabaseUser = Depends(require_supabase_user),
+) -> dict[str, Any]:
+    # 1. Get all folders to find descendants
+    all_folders = metadata_service.list_folders()
+    
+    # Build adjacency list
+    children_map = {}
+    for f in all_folders:
+        pid = f.get('parent_id')
+        if pid:
+            children_map.setdefault(pid, []).append(f['id'])
+    
+    # BFS to find all descendant IDs and track depth/order
+    # We want to delete children before parents, so we record order.
+    folders_to_delete = [] # Ordered list
+    queue = [folder_id]
+    visited = {folder_id}
+    
+    while queue:
+        curr = queue.pop(0)
+        folders_to_delete.append(curr)
+        
+        if curr in children_map:
+            for child_id in children_map[curr]:
+                if child_id not in visited:
+                    visited.add(child_id)
+                    queue.append(child_id)
+    
+    # Reverse to delete children first
+    folders_to_delete_reversed = list(reversed(folders_to_delete))
+    
+    # 2. Get all documents in these folders
+    docs = metadata_service.list_documents(folder_ids=folders_to_delete)
+    
+    # 3. Delete documents
+    deleted_docs_count = 0
+    for doc in docs:
+        rel_path = doc.get("relative_path")
+        if rel_path:
+            try:
+                # Delete vector, storage, metadata
+                await run_in_threadpool(vector_service.remove_documents, [rel_path])
+                await run_in_threadpool(storage_service.delete_file, rel_path)
+                await run_in_threadpool(partial(metadata_service.delete_document, rel_path))
+                deleted_docs_count += 1
+            except Exception as e:
+                logger.error(f"Failed to delete document {rel_path} during folder delete: {e}")
+
+    # 4. Delete folders
+    deleted_folders_count = 0
+    for fid in folders_to_delete_reversed:
+        if metadata_service.delete_folder(fid):
+             deleted_folders_count += 1
+
+    return {
+        "message": f"Deleted {deleted_folders_count} folders and {deleted_docs_count} documents.",
+        "folders_deleted": folders_to_delete,
+        "documents_deleted_count": deleted_docs_count
     }

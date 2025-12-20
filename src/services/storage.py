@@ -274,6 +274,43 @@ class StorageService:
                 raise FileNotFoundError(f"File not found locally: {relative_path}")
             return target_path, content_type
 
+    def download_to_temp(self, relative_path: str) -> Path:
+        """Download a file from storage to a temporary file for processing."""
+        path_obj = Path(relative_path)
+        target_path = (self.base_dir / path_obj).resolve()
+        
+        # Security check
+        try:
+            target_path.relative_to(self.base_dir)
+        except ValueError:
+             raise ValueError("Attempted to access a path outside the storage directory")
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=path_obj.suffix or ".pdf")
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+
+        if self._supabase_enabled:
+            try:
+                bucket = self._supabase_client.storage.from_(self._supabase_bucket)
+                with open(temp_path, "wb") as f:
+                    res = bucket.download(path_obj.as_posix())
+                    f.write(res)
+                return temp_path
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to download %s from Supabase: %s; falling back to local",
+                    relative_path, exc
+                )
+        
+        # Fallback / Local
+        if not target_path.exists():
+            if temp_path.exists():
+                temp_path.unlink()
+            raise FileNotFoundError(f"File not found: {relative_path}")
+            
+        shutil.copyfile(target_path, temp_path)
+        return temp_path
+
     def cleanup_local_path(self, local_path: Path, *, allow_dir_cleanup: bool = False) -> None:
         """Delete a temporary local file created during ingestion."""
         if not local_path.exists():
