@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List
+from typing import List,Optional
 from src.core.dependencies import get_current_org_admin
 from src.services.org_admin_service import OrgAdminService
 from src.models.org_admin import BranchDTO, CreateBranchRequest, OrgUserDTO, InviteUserRequest
@@ -36,6 +36,32 @@ async def get_users(org_id: str = Depends(get_current_org_admin)):
     """
     try:
         return await OrgAdminService.get_users(org_id)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@router.get("/resources/search", status_code=status.HTTP_200_OK)
+async def search_resources(
+    q: str,
+    org_id: str = Depends(get_current_org_admin)
+):
+    """
+    Search for folders and documents in the organization.
+    """
+    try:
+        return await OrgAdminService.search_resources(org_id, q)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@router.get("/resources/browse", status_code=status.HTTP_200_OK)
+async def browse_resources(
+    folder_id: Optional[str] = None,
+    org_id: str = Depends(get_current_org_admin)
+):
+    """
+    Browse folders and documents hierarchically.
+    """
+    try:
+        return await OrgAdminService.get_folder_contents(org_id, folder_id)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 

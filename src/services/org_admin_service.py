@@ -1,6 +1,6 @@
 from src.core.database import supabase
 from src.models.org_admin import BranchDTO, CreateBranchRequest, OrgUserDTO, InviteUserRequest
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 
 class OrgAdminService:
@@ -57,6 +57,69 @@ class OrgAdminService:
             return users
         except Exception as e:
             print(f"Error fetching users: {e}")
+            raise e
+
+    @staticmethod
+    async def search_resources(org_id: str, query: str):
+        try:
+            resources = []
+            # Search folders
+            folders = supabase.table("folders")\
+                .select("id, name")\
+                .eq("organization_id", org_id)\
+                .ilike("name", f"%{query}%")\
+                .limit(10)\
+                .execute()
+            
+            for f in folders.data:
+                resources.append({"id": f['id'], "name": f['name'], "type": "folder"})
+
+            # Search documents
+            docs = supabase.table("documents")\
+                .select("id, title")\
+                .eq("organization_id", org_id)\
+                .ilike("title", f"%{query}%")\
+                .limit(10)\
+                .execute()
+                
+            for d in docs.data:
+                resources.append({"id": d['id'], "name": d['title'], "type": "document"})
+                
+            return resources
+        except Exception as e:
+            print(f"Error searching resources: {e}")
+            raise e
+
+    @staticmethod
+    async def get_folder_contents(org_id: str, folder_id: Optional[str] = None):
+        try:
+            items = []
+            
+            # Fetch Subfolders
+            query = supabase.table("folders").select("id, name").eq("organization_id", org_id)
+            if folder_id:
+                query = query.eq("parent_id", folder_id)
+            else:
+                query = query.is_("parent_id", "null")
+            
+            folders = query.execute()
+            for f in folders.data:
+                items.append({"id": f['id'], "name": f['name'], "type": "folder"})
+
+            # Fetch Documents (only if inside a folder, or root docs if applicable)
+            doc_query = supabase.table("documents").select("id, title").eq("organization_id", org_id)
+            if folder_id:
+                doc_query = doc_query.eq("folder_id", folder_id)
+            else:
+                doc_query = doc_query.is_("folder_id", "null")
+                
+            docs = doc_query.execute()
+            for d in docs.data:
+                items.append({"id": d['id'], "name": d['title'], "type": "document"})
+                
+            return items
+        except Exception as e:
+            print(f"Error fetching folder contents: {e}")
             raise e
 
     @staticmethod

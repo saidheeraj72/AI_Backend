@@ -29,12 +29,37 @@ class UserService:
                 # Default to False if check fails
                 is_superadmin = False
 
+            # Fetch Organization Context (First active membership)
+            org_id = None
+            org_name = None
+            org_role = None
+            try:
+                org_response = supabase.table("organization_members")\
+                    .select("role, organization_id, organizations(name)")\
+                    .eq("user_id", user_id)\
+                    .maybe_single()\
+                    .execute()
+                
+                if org_response.data:
+                    org_member = org_response.data
+                    org_id = org_member.get('organization_id')
+                    org_role = org_member.get('role')
+                    # Access joined organization data
+                    org_data = org_member.get('organizations')
+                    if org_data:
+                        org_name = org_data.get('name')
+            except Exception as e:
+                print(f"Error fetching organization context: {e}")
+
             return UserConfigResponse(
                 user_id=data['id'],
                 email=data['email'],
                 is_superadmin=is_superadmin,
                 full_name=data.get('full_name'),
-                avatar_url=data.get('avatar_url')
+                avatar_url=data.get('avatar_url'),
+                organization_id=org_id,
+                organization_name=org_name,
+                role=org_role
             )
         except Exception as e:
             print(f"Error fetching user config: {e}")
